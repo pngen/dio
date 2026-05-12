@@ -18,45 +18,63 @@ use thiserror::Error;
 // ERROR TYPES
 // =============================================================================
 
+/// Errors that can occur during DIO operations.
 #[derive(Debug, Error)]
 pub enum DioError {
+    /// Validation error with a descriptive message.
     #[error("Validation error: {0}")]
     Validation(String),
 
+    /// Policy violation with type and details.
     #[error("Policy violation [{policy_type}]: {message}")]
     PolicyViolation {
+        /// Human-readable violation message.
         message: String,
+        /// The type of policy that was violated.
         policy_type: PolicyType,
+        /// Additional context or metadata about the violation.
         details: HashMap<String, serde_json::Value>,
     },
 
+    /// Execution error with a descriptive message.
     #[error("Execution error: {0}")]
     Execution(String),
 
+    /// Graph structure error with a descriptive message.
     #[error("Graph error: {0}")]
     Graph(String),
 
+    /// Cryptographic integrity error with a descriptive message.
     #[error("Integrity error: {0}")]
     Integrity(String),
 
+    /// State transition or lifecycle error with a descriptive message.
     #[error("State error: {0}")]
     State(String),
 }
 
+/// Result type alias for DIO operations.
 pub type DioResult<T> = Result<T, DioError>;
 
 // =============================================================================
 // ENUMS - With Display instead of ToString (idiomatic Rust)
 // =============================================================================
 
+/// Types of nodes within an execution graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeType {
+    /// A node that invokes an AI model.
     ModelCall,
+    /// A node that invokes an external tool.
     ToolCall,
+    /// A node that makes a branching decision.
     Decision,
+    /// A node that handles retry logic.
     Retry,
+    /// A node that performs an observable side effect.
     SideEffect,
+    /// A node that produces final output.
     Output,
 }
 
@@ -73,16 +91,25 @@ impl std::fmt::Display for NodeType {
     }
 }
 
+/// Categories of governance policies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyType {
+    /// Restricts which models can be invoked.
     ModelAccess,
+    /// Restricts which tools can be invoked.
     ToolAccess,
+    /// Caps resource consumption (tokens, time, retries).
     ResourceLimits,
+    /// Controls data leaving the system.
     DataEgress,
+    /// Governs retry attempts and backoff.
     RetryBehavior,
+    /// Validates and restricts side effects.
     SideEffects,
+    /// Enforces maximum execution cost.
     CostCeiling,
+    /// Requires explicit human authorization.
     HumanApproval,
 }
 
@@ -101,15 +128,23 @@ impl std::fmt::Display for PolicyType {
     }
 }
 
+/// Types of events recorded in the execution transcript.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryType {
+    /// Graph submitted for execution.
     Submission,
+    /// Node execution began.
     NodeStart,
+    /// Node execution finished successfully.
     NodeComplete,
+    /// Node execution failed.
     NodeFailure,
+    /// Overall execution failed.
     Failure,
+    /// Overall execution completed successfully.
     Completion,
+    /// A policy rule was violated.
     PolicyViolation,
 }
 
@@ -127,12 +162,15 @@ impl std::fmt::Display for EntryType {
     }
 }
 
-/// Type-safe determinism classification (replaces stringly-typed version)
+/// Classification of a node's determinism characteristics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Determinism {
+    /// Produces identical output for identical input every time.
     Deterministic,
+    /// May vary within bounded constraints (e.g., sampling temperature).
     BoundedNondeterministic,
+    /// Depends on external or unpredictable factors.
     ExternalNondeterministic,
 }
 
@@ -146,13 +184,19 @@ impl std::fmt::Display for Determinism {
     }
 }
 
+/// Lifecycle status of an execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionStatus {
+    /// Awaiting execution.
     Pending,
+    /// Currently executing.
     Running,
+    /// Finished successfully.
     Completed,
+    /// Finished with an error.
     Failed,
+    /// Blocked by policy or dependency.
     Blocked,
 }
 
@@ -172,18 +216,26 @@ impl std::fmt::Display for ExecutionStatus {
 // GRAPH NODE - Type-safe determinism
 // =============================================================================
 
+/// A single node within an execution graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphNode {
+    /// Unique identifier for the node.
     pub id: String,
+    /// The functional type of this node.
     #[serde(rename = "type")]
     pub node_type: NodeType,
+    /// Node-specific configuration and parameters.
     pub data: HashMap<String, serde_json::Value>,
+    /// Determinism classification for this node.
     pub determinism: Determinism,
+    /// IDs of nodes that must complete before this node runs.
     pub dependencies: Vec<String>,
+    /// Additional non-functional metadata.
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
 impl GraphNode {
+    /// Creates a new validated graph node.
     pub fn new(
         id: String,
         node_type: NodeType,
@@ -218,14 +270,19 @@ impl GraphNode {
 // EXECUTION GRAPH - Deterministic hashing via sorted canonical form
 // =============================================================================
 
+/// An immutable, declarative workflow description.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionGraph {
+    /// All nodes in the workflow.
     pub nodes: Vec<GraphNode>,
+    /// Workflow-level metadata.
     pub metadata: HashMap<String, serde_json::Value>,
+    /// Schema or protocol version of the graph.
     pub version: String,
 }
 
 impl ExecutionGraph {
+    /// Creates a new validated execution graph.
     pub fn new(
         nodes: Vec<GraphNode>,
         metadata: HashMap<String, serde_json::Value>,
@@ -349,10 +406,12 @@ impl ExecutionGraph {
         None
     }
 
+    /// Retrieves a node by its unique identifier.
     pub fn get_node(&self, id: &str) -> Option<&GraphNode> {
         self.nodes.iter().find(|n| n.id == id)
     }
 
+    /// Retrieves all nodes matching a specific type.
     pub fn get_nodes_by_type(&self, node_type: NodeType) -> Vec<&GraphNode> {
         self.nodes.iter().filter(|n| n.node_type == node_type).collect()
     }
@@ -362,19 +421,27 @@ impl ExecutionGraph {
 // POLICY RULE
 // =============================================================================
 
+/// A single governance rule evaluated before execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyRule {
+    /// Unique identifier for the rule.
     pub id: String,
+    /// The category of policy this rule enforces.
     #[serde(rename = "type")]
     pub policy_type: PolicyType,
+    /// Conditions that trigger this rule.
     pub conditions: HashMap<String, serde_json::Value>,
+    /// Actions to take when conditions are met.
     pub actions: Vec<String>,
+    /// Human-readable description of the rule.
     pub description: String,
+    /// Evaluation priority (higher = evaluated first).
     #[serde(default)]
     pub priority: u32,
 }
 
 impl PolicyRule {
+    /// Creates a new policy rule with default priority.
     pub fn new(
         id: String,
         policy_type: PolicyType,
@@ -385,6 +452,7 @@ impl PolicyRule {
         Self::with_priority(id, policy_type, conditions, actions, description, 0)
     }
 
+    /// Creates a new policy rule with an explicit priority.
     pub fn with_priority(
         id: String,
         policy_type: PolicyType,
@@ -457,6 +525,7 @@ impl PolicyRule {
 // DETERMINISM TRACKER - Sorted vectors for deterministic hashing
 // =============================================================================
 
+/// Tracks and classifies determinism characteristics across executed nodes.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeterminismTracker {
     deterministic: Vec<String>,
@@ -465,10 +534,12 @@ pub struct DeterminismTracker {
 }
 
 impl DeterminismTracker {
+    /// Creates a new empty determinism tracker.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Records a node's determinism classification.
     pub fn record(&mut self, node_id: String, determinism: Determinism) {
         let list = match determinism {
             Determinism::Deterministic => &mut self.deterministic,
@@ -480,14 +551,17 @@ impl DeterminismTracker {
         }
     }
 
+    /// Returns the list of fully deterministic nodes.
     pub fn deterministic_nodes(&self) -> &[String] {
         &self.deterministic
     }
 
+    /// Returns the list of bounded nondeterministic nodes.
     pub fn bounded_nodes(&self) -> &[String] {
         &self.bounded_nondeterministic
     }
 
+    /// Returns the list of external nondeterministic nodes.
     pub fn external_nodes(&self) -> &[String] {
         &self.external_nondeterministic
     }
@@ -517,12 +591,18 @@ impl DeterminismTracker {
 // TRANSCRIPT - Chain-hashed entries for tamper evidence
 // =============================================================================
 
+/// A single tamper-evident log entry in the execution transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptEntry {
+    /// The type of event recorded.
     pub entry_type: EntryType,
+    /// Unix timestamp when the entry was created.
     pub timestamp: u64,
+    /// Monotonically increasing sequence number.
     pub sequence: u64,
+    /// Event-specific payload data.
     pub data: HashMap<String, serde_json::Value>,
+    /// Hash of the previous entry, forming a chain.
     pub prev_hash: String,
 }
 
@@ -541,19 +621,26 @@ impl TranscriptEntry {
     }
 }
 
+/// An append-only, cryptographically verifiable execution log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionTranscript {
+    /// Unique identifier for this execution run.
     pub execution_id: String,
+    /// Hash of the graph that was executed.
     pub graph_hash: String,
+    /// Unix timestamp when the transcript was created.
     pub created_at: u64,
     entries: Vec<TranscriptEntry>,
     next_sequence: u64,
     chain_head: String,
+    /// Cryptographic signature of the transcript (optional).
     pub signature: Option<String>,
+    /// Hash representing the determinism classification of executed nodes.
     pub determinism_hash: Option<String>,
 }
 
 impl ExecutionTranscript {
+    /// Creates a new empty transcript.
     pub fn new(execution_id: String, graph_hash: String, timestamp: u64) -> Self {
         Self {
             execution_id,
@@ -567,6 +654,7 @@ impl ExecutionTranscript {
         }
     }
 
+    /// Appends a new entry to the transcript chain.
     pub fn add_entry(&mut self, entry_type: EntryType, data: HashMap<String, serde_json::Value>) {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -586,6 +674,7 @@ impl ExecutionTranscript {
         self.entries.push(entry);
     }
 
+    /// Returns a slice of all transcript entries.
     pub fn entries(&self) -> &[TranscriptEntry] {
         &self.entries
     }
@@ -632,10 +721,12 @@ impl ExecutionTranscript {
         Ok(())
     }
 
+    /// Returns all entries matching a specific type.
     pub fn get_entries_by_type(&self, entry_type: EntryType) -> Vec<&TranscriptEntry> {
         self.entries.iter().filter(|e| e.entry_type == entry_type).collect()
     }
 
+    /// Computes the cryptographic hash of the transcript state.
     pub fn hash(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.execution_id.as_bytes());
@@ -648,6 +739,7 @@ impl ExecutionTranscript {
         format!("{:x}", hasher.finalize())
     }
 
+    /// Signs the transcript with the provided HMAC key.
     pub fn sign(&mut self, key: &[u8]) {
         use hmac::{Hmac, Mac};
         type HmacSha256 = Hmac<Sha256>;
@@ -656,6 +748,7 @@ impl ExecutionTranscript {
         self.signature = Some(format!("{:x}", mac.finalize().into_bytes()));
     }
 
+    /// Verifies the transcript signature against the provided HMAC key.
     pub fn verify_signature(&self, key: &[u8]) -> bool {
         let Some(sig) = &self.signature else { return false };
         use hmac::{Hmac, Mac};
@@ -670,14 +763,22 @@ impl ExecutionTranscript {
 // EXECUTION CONTEXT
 // =============================================================================
 
+/// Runtime state container for a single execution workflow.
 #[derive(Debug)]
 pub struct ExecutionContext {
+    /// Unique execution identifier.
     pub execution_id: String,
+    /// The workflow being executed.
     pub graph: ExecutionGraph,
+    /// The tamper-evident execution log.
     pub transcript: ExecutionTranscript,
+    /// Tracks determinism classifications of nodes.
     pub determinism_tracker: DeterminismTracker,
+    /// Unix timestamp when execution started.
     pub start_time: u64,
+    /// Current lifecycle status.
     pub status: ExecutionStatus,
+    /// Error message if execution failed.
     pub error: Option<String>,
     node_results: HashMap<String, serde_json::Value>,
 }
@@ -686,25 +787,30 @@ pub struct ExecutionContext {
 // POLICY ENGINE
 // =============================================================================
 
+/// Evaluates governance rules against graphs and nodes.
 #[derive(Debug, Default)]
 pub struct PolicyEngine {
     rules: Vec<PolicyRule>,
 }
 
 impl PolicyEngine {
+    /// Creates a new empty policy engine.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Adds a policy rule and sorts by priority.
     pub fn add_rule(&mut self, rule: PolicyRule) {
         self.rules.push(rule);
         self.rules.sort_by(|a, b| b.priority.cmp(&a.priority));
     }
 
+    /// Returns a slice of all registered rules.
     pub fn rules(&self) -> &[PolicyRule] {
         &self.rules
     }
 
+    /// Enforces graph-level policies before execution begins.
     pub fn enforce_graph(&self, graph: &ExecutionGraph, transcript: &mut ExecutionTranscript) -> DioResult<()> {
         for rule in &self.rules {
             if let PolicyType::ResourceLimits = rule.policy_type {
@@ -720,6 +826,7 @@ impl PolicyEngine {
         Ok(())
     }
 
+    /// Enforces node-level policies before a node executes.
     pub fn enforce_node(&self, node: &GraphNode, transcript: &mut ExecutionTranscript) -> DioResult<()> {
         for rule in &self.rules {
             match rule.policy_type {
