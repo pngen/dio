@@ -248,7 +248,10 @@ impl GraphNode {
             return Err(DioError::Validation("Node ID cannot be empty".into()));
         }
         // Validate ID format (alphanumeric + underscore)
-        if !id.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+        if !id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        {
             return Err(DioError::Validation(format!(
                 "Node ID '{}' contains invalid characters",
                 id
@@ -289,7 +292,9 @@ impl ExecutionGraph {
         version: String,
     ) -> DioResult<Self> {
         if nodes.is_empty() {
-            return Err(DioError::Graph("Graph must contain at least one node".into()));
+            return Err(DioError::Graph(
+                "Graph must contain at least one node".into(),
+            ));
         }
 
         let mut seen_ids = HashSet::new();
@@ -299,7 +304,11 @@ impl ExecutionGraph {
             }
         }
 
-        Ok(Self { nodes, metadata, version })
+        Ok(Self {
+            nodes,
+            metadata,
+            version,
+        })
     }
 
     /// Deterministic hash: sorts nodes by ID, sorts all map keys
@@ -413,7 +422,10 @@ impl ExecutionGraph {
 
     /// Retrieves all nodes matching a specific type.
     pub fn get_nodes_by_type(&self, node_type: NodeType) -> Vec<&GraphNode> {
-        self.nodes.iter().filter(|n| n.node_type == node_type).collect()
+        self.nodes
+            .iter()
+            .filter(|n| n.node_type == node_type)
+            .collect()
     }
 }
 
@@ -465,7 +477,9 @@ impl PolicyRule {
             return Err(DioError::Validation("Policy ID cannot be empty".into()));
         }
         if actions.is_empty() {
-            return Err(DioError::Validation("Policy must have at least one action".into()));
+            return Err(DioError::Validation(
+                "Policy must have at least one action".into(),
+            ));
         }
         if conditions.is_empty() {
             return Err(DioError::Validation("Policy must have conditions".into()));
@@ -498,12 +512,36 @@ impl PolicyRule {
                 }
             }
             PolicyType::ResourceLimits => {
-                let has_limit = ["max_tokens", "max_time_seconds", "max_retries"]
+                let has_limit = ["max_nodes", "max_tokens", "max_time_seconds", "max_retries"]
                     .iter()
                     .any(|k| conditions.contains_key(*k));
                 if !has_limit {
                     return Err(DioError::Validation(
                         "RESOURCE_LIMITS requires at least one limit".into(),
+                    ));
+                }
+            }
+            PolicyType::DataEgress => {
+                let allowed = conditions.get("allowed_domains");
+                if !matches!(allowed, Some(v) if v.is_array()) {
+                    return Err(DioError::Validation(
+                        "DATA_EGRESS requires 'allowed_domains' array".into(),
+                    ));
+                }
+            }
+            PolicyType::RetryBehavior => {
+                let max_retries = conditions.get("max_retries");
+                if !matches!(max_retries, Some(v) if v.is_number()) {
+                    return Err(DioError::Validation(
+                        "RETRY_BEHAVIOR requires numeric 'max_retries'".into(),
+                    ));
+                }
+            }
+            PolicyType::SideEffects => {
+                let allowed = conditions.get("allowed_side_effects");
+                if !matches!(allowed, Some(v) if v.is_array()) {
+                    return Err(DioError::Validation(
+                        "SIDE_EFFECTS requires 'allowed_side_effects' array".into(),
                     ));
                 }
             }
@@ -723,7 +761,10 @@ impl ExecutionTranscript {
 
     /// Returns all entries matching a specific type.
     pub fn get_entries_by_type(&self, entry_type: EntryType) -> Vec<&TranscriptEntry> {
-        self.entries.iter().filter(|e| e.entry_type == entry_type).collect()
+        self.entries
+            .iter()
+            .filter(|e| e.entry_type == entry_type)
+            .collect()
     }
 
     /// Computes the cryptographic hash of the transcript state.
@@ -750,7 +791,9 @@ impl ExecutionTranscript {
 
     /// Verifies the transcript signature against the provided HMAC key.
     pub fn verify_signature(&self, key: &[u8]) -> bool {
-        let Some(sig) = &self.signature else { return false };
+        let Some(sig) = &self.signature else {
+            return false;
+        };
         use hmac::{Hmac, Mac};
         type HmacSha256 = Hmac<Sha256>;
         let mut mac = HmacSha256::new_from_slice(key).expect("valid key");
@@ -811,47 +854,196 @@ impl PolicyEngine {
     }
 
     /// Enforces graph-level policies before execution begins.
-    pub fn enforce_graph(&self, graph: &ExecutionGraph, transcript: &mut ExecutionTranscript) -> DioResult<()> {
+    pub fn enforce_graph(
+        &self,
+        graph: &ExecutionGraph,
+        transcript: &mut ExecutionTranscript,
+    ) -> DioResult<()> {
         for rule in &self.rules {
-            if let PolicyType::ResourceLimits = rule.policy_type {
-                if let Some(max) = rule.conditions.get("max_nodes").and_then(|v| v.as_u64()) {
-                    if graph.nodes.len() as u64 > max {
-                        return self.violation(rule, transcript, format!(
-                            "Graph has {} nodes, max is {}", graph.nodes.len(), max
-                        ));
+            match rule.policy_type {
+                PolicyType::ResourceLimits => {
+                    if let Some(max) = rule.conditions.get("max_nodes").and_then(|v| v.as_u64()) {
+                        if graph.nodes.len() as u64 > max {
+                            return self.violation(
+                                rule,
+                                transcript,
+                                format!("Graph has {} nodes, max is {}", graph.nodes.len(), max),
+                            );
+                        }
                     }
                 }
+                PolicyType::CostCeiling => {
+                    if let Some(max) = rule.conditions.get("max_cost").and_then(|v| v.as_f64()) {
+                        let estimated_cost = graph
+                            .metadata
+                            .get("estimated_cost")
+                            .or_else(|| graph.metadata.get("cost"))
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or_else(|| {
+                                graph
+                                    .nodes
+                                    .iter()
+                                    .filter_map(|node| {
+                                        node.data
+                                            .get("estimated_cost")
+                                            .or_else(|| node.data.get("cost"))
+                                            .and_then(|v| v.as_f64())
+                                    })
+                                    .sum()
+                            });
+                        if estimated_cost > max {
+                            return self.violation(
+                                rule,
+                                transcript,
+                                format!("Estimated cost {} exceeds max {}", estimated_cost, max),
+                            );
+                        }
+                    }
+                }
+                PolicyType::HumanApproval => {
+                    let required = rule
+                        .conditions
+                        .get("required")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let approved = graph
+                        .metadata
+                        .get("human_approved")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if required && !approved {
+                        return self.violation(
+                            rule,
+                            transcript,
+                            "Human approval is required before execution".into(),
+                        );
+                    }
+                }
+                _ => {}
             }
         }
         Ok(())
     }
 
     /// Enforces node-level policies before a node executes.
-    pub fn enforce_node(&self, node: &GraphNode, transcript: &mut ExecutionTranscript) -> DioResult<()> {
+    pub fn enforce_node(
+        &self,
+        node: &GraphNode,
+        transcript: &mut ExecutionTranscript,
+    ) -> DioResult<()> {
         for rule in &self.rules {
             match rule.policy_type {
                 PolicyType::ModelAccess if node.node_type == NodeType::ModelCall => {
-                    if let (Some(model), Some(allowed)) = (
-                        node.data.get("model_name").and_then(|v| v.as_str()),
-                        rule.conditions.get("allowed_models").and_then(|v| v.as_array()),
-                    ) {
-                        if !allowed.iter().any(|v| v.as_str() == Some(model)) {
-                            return self.violation(rule, transcript, format!(
-                                "Model '{}' not allowed", model
-                            ));
-                        }
+                    let Some(model) = node.data.get("model_name").and_then(|v| v.as_str()) else {
+                        return self.violation(rule, transcript, "Model name is required".into());
+                    };
+                    let Some(allowed) = rule
+                        .conditions
+                        .get("allowed_models")
+                        .and_then(|v| v.as_array())
+                    else {
+                        continue;
+                    };
+                    if !allowed.iter().any(|v| v.as_str() == Some(model)) {
+                        return self.violation(
+                            rule,
+                            transcript,
+                            format!("Model '{}' not allowed", model),
+                        );
                     }
                 }
                 PolicyType::ToolAccess if node.node_type == NodeType::ToolCall => {
-                    if let (Some(tool), Some(allowed)) = (
-                        node.data.get("tool_name").and_then(|v| v.as_str()),
-                        rule.conditions.get("allowed_tools").and_then(|v| v.as_array()),
-                    ) {
-                        if !allowed.iter().any(|v| v.as_str() == Some(tool)) {
-                            return self.violation(rule, transcript, format!(
-                                "Tool '{}' not allowed", tool
-                            ));
+                    let Some(tool) = node.data.get("tool_name").and_then(|v| v.as_str()) else {
+                        return self.violation(rule, transcript, "Tool name is required".into());
+                    };
+                    let Some(allowed) = rule
+                        .conditions
+                        .get("allowed_tools")
+                        .and_then(|v| v.as_array())
+                    else {
+                        continue;
+                    };
+                    if !allowed.iter().any(|v| v.as_str() == Some(tool)) {
+                        return self.violation(
+                            rule,
+                            transcript,
+                            format!("Tool '{}' not allowed", tool),
+                        );
+                    }
+                }
+                PolicyType::ResourceLimits => {
+                    for (node_key, limit_key) in [
+                        ("tokens", "max_tokens"),
+                        ("time_seconds", "max_time_seconds"),
+                        ("retry_count", "max_retries"),
+                    ] {
+                        if let (Some(actual), Some(max)) = (
+                            node.data.get(node_key).and_then(|v| v.as_u64()),
+                            rule.conditions.get(limit_key).and_then(|v| v.as_u64()),
+                        ) {
+                            if actual > max {
+                                return self.violation(
+                                    rule,
+                                    transcript,
+                                    format!("{} {} exceeds max {}", node_key, actual, max),
+                                );
+                            }
                         }
+                    }
+                }
+                PolicyType::DataEgress => {
+                    if let Some(domain) = node.data.get("egress_domain").and_then(|v| v.as_str()) {
+                        let Some(allowed) = rule
+                            .conditions
+                            .get("allowed_domains")
+                            .and_then(|v| v.as_array())
+                        else {
+                            continue;
+                        };
+                        if !allowed.iter().any(|v| v.as_str() == Some(domain)) {
+                            return self.violation(
+                                rule,
+                                transcript,
+                                format!("Egress domain '{}' not allowed", domain),
+                            );
+                        }
+                    }
+                }
+                PolicyType::RetryBehavior if node.node_type == NodeType::Retry => {
+                    if let (Some(actual), Some(max)) = (
+                        node.data.get("retry_count").and_then(|v| v.as_u64()),
+                        rule.conditions.get("max_retries").and_then(|v| v.as_u64()),
+                    ) {
+                        if actual > max {
+                            return self.violation(
+                                rule,
+                                transcript,
+                                format!("Retry count {} exceeds max {}", actual, max),
+                            );
+                        }
+                    }
+                }
+                PolicyType::SideEffects if node.node_type == NodeType::SideEffect => {
+                    let Some(effect) = node.data.get("effect_type").and_then(|v| v.as_str()) else {
+                        return self.violation(
+                            rule,
+                            transcript,
+                            "Side effect type is required".into(),
+                        );
+                    };
+                    let Some(allowed) = rule
+                        .conditions
+                        .get("allowed_side_effects")
+                        .and_then(|v| v.as_array())
+                    else {
+                        continue;
+                    };
+                    if !allowed.iter().any(|v| v.as_str() == Some(effect)) {
+                        return self.violation(
+                            rule,
+                            transcript,
+                            format!("Side effect '{}' not allowed", effect),
+                        );
                     }
                 }
                 _ => {}
@@ -867,12 +1059,18 @@ impl PolicyEngine {
         message: String,
     ) -> DioResult<()> {
         let mut data = HashMap::new();
-        data.insert("policy_id".into(), serde_json::Value::String(rule.id.clone()));
-        data.insert("policy_type".into(), serde_json::Value::String(rule.policy_type.to_string()));
+        data.insert(
+            "policy_id".into(),
+            serde_json::Value::String(rule.id.clone()),
+        );
+        data.insert(
+            "policy_type".into(),
+            serde_json::Value::String(rule.policy_type.to_string()),
+        );
         data.insert("message".into(), serde_json::Value::String(message.clone()));
-        
+
         transcript.add_entry(EntryType::PolicyViolation, data);
-        
+
         Err(DioError::PolicyViolation {
             message,
             policy_type: rule.policy_type,
@@ -880,7 +1078,6 @@ impl PolicyEngine {
         })
     }
 }
-
 
 // =============================================================================
 // INTELLIGENCE ORCHESTRATOR - Thread-safe execution engine
@@ -914,11 +1111,8 @@ impl IntelligenceOrchestrator {
             .unwrap_or(0);
 
         let graph_hash = graph.hash();
-        let mut transcript = ExecutionTranscript::new(
-            execution_id.clone(),
-            graph_hash.clone(),
-            timestamp,
-        );
+        let mut transcript =
+            ExecutionTranscript::new(execution_id.clone(), graph_hash.clone(), timestamp);
 
         // Record submission
         let mut data = HashMap::new();
@@ -1020,8 +1214,14 @@ impl IntelligenceOrchestrator {
             - ctx.start_time;
 
         let mut data = HashMap::new();
-        data.insert("status".into(), serde_json::Value::String("completed".into()));
-        data.insert("duration_seconds".into(), serde_json::Value::Number(duration.into()));
+        data.insert(
+            "status".into(),
+            serde_json::Value::String("completed".into()),
+        );
+        data.insert(
+            "duration_seconds".into(),
+            serde_json::Value::Number(duration.into()),
+        );
         ctx.transcript.add_entry(EntryType::Completion, data);
 
         // Persist determinism hash
@@ -1086,7 +1286,9 @@ impl IntelligenceOrchestrator {
         }
 
         if order.len() != graph.nodes.len() {
-            return Err(DioError::Graph("Circular dependency detected during execution".into()));
+            return Err(DioError::Graph(
+                "Circular dependency detected during execution".into(),
+            ));
         }
 
         Ok(order)
@@ -1110,8 +1312,14 @@ impl IntelligenceOrchestrator {
 
             let mut data = HashMap::new();
             data.insert("node_id".into(), serde_json::Value::String(node_id.into()));
-            data.insert("node_type".into(), serde_json::Value::String(node.node_type.to_string()));
-            data.insert("determinism".into(), serde_json::Value::String(node.determinism.to_string()));
+            data.insert(
+                "node_type".into(),
+                serde_json::Value::String(node.node_type.to_string()),
+            );
+            data.insert(
+                "determinism".into(),
+                serde_json::Value::String(node.determinism.to_string()),
+            );
             ctx.transcript.add_entry(EntryType::NodeStart, data);
         }
 
@@ -1138,13 +1346,17 @@ impl IntelligenceOrchestrator {
             let mut executions = self.executions.write();
             let ctx = executions.get_mut(execution_id).unwrap();
 
-            ctx.determinism_tracker.record(node_id.to_string(), node.determinism);
+            ctx.determinism_tracker
+                .record(node_id.to_string(), node.determinism);
             ctx.node_results.insert(node_id.to_string(), result.clone());
 
             let mut data = HashMap::new();
             data.insert("node_id".into(), serde_json::Value::String(node_id.into()));
             data.insert("result".into(), result);
-            data.insert("determinism".into(), serde_json::Value::String(node.determinism.to_string()));
+            data.insert(
+                "determinism".into(),
+                serde_json::Value::String(node.determinism.to_string()),
+            );
             ctx.transcript.add_entry(EntryType::NodeComplete, data);
         }
 
@@ -1177,9 +1389,9 @@ impl IntelligenceOrchestrator {
     /// Verify execution integrity: transcript chain, graph hash, determinism hash.
     pub fn verify(&self, execution_id: &str) -> DioResult<bool> {
         let executions = self.executions.read();
-        let ctx = executions.get(execution_id).ok_or_else(|| {
-            DioError::State(format!("Unknown execution ID: {}", execution_id))
-        })?;
+        let ctx = executions
+            .get(execution_id)
+            .ok_or_else(|| DioError::State(format!("Unknown execution ID: {}", execution_id)))?;
 
         // Verify transcript integrity
         ctx.transcript.verify_integrity()?;
@@ -1206,7 +1418,10 @@ impl IntelligenceOrchestrator {
 
     /// Get a copy of the transcript.
     pub fn transcript(&self, execution_id: &str) -> Option<ExecutionTranscript> {
-        self.executions.read().get(execution_id).map(|c| c.transcript.clone())
+        self.executions
+            .read()
+            .get(execution_id)
+            .map(|c| c.transcript.clone())
     }
 
     /// Add a policy rule to the engine.
@@ -1269,7 +1484,8 @@ mod tests {
         let n1 = node("a", NodeType::Output, &[]);
         let n2 = node("b", NodeType::ModelCall, &["a"]);
 
-        let g1 = ExecutionGraph::new(vec![n1.clone(), n2.clone()], HashMap::new(), "1.0".into()).unwrap();
+        let g1 = ExecutionGraph::new(vec![n1.clone(), n2.clone()], HashMap::new(), "1.0".into())
+            .unwrap();
         let g2 = ExecutionGraph::new(vec![n2, n1], HashMap::new(), "1.0".into()).unwrap();
 
         assert_eq!(g1.hash(), g2.hash(), "Hash must be order-independent");
@@ -1361,6 +1577,172 @@ mod tests {
     }
 
     #[test]
+    fn test_model_policy_requires_explicit_model_name() {
+        let mut conditions = HashMap::new();
+        conditions.insert("allowed_models".into(), serde_json::json!(["gpt-4"]));
+
+        let rule = PolicyRule::new(
+            "model_policy".into(),
+            PolicyType::ModelAccess,
+            conditions,
+            vec!["allow".into()],
+            "Test policy".into(),
+        )
+        .unwrap();
+
+        let mut engine = PolicyEngine::new();
+        engine.add_rule(rule);
+
+        let node = GraphNode::new(
+            "n1".into(),
+            NodeType::ModelCall,
+            HashMap::new(),
+            Determinism::Deterministic,
+            vec![],
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let mut transcript = ExecutionTranscript::new("t".into(), "h".into(), 0);
+        assert!(matches!(
+            engine.enforce_node(&node, &mut transcript),
+            Err(DioError::PolicyViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn test_tool_policy_requires_explicit_tool_name() {
+        let mut conditions = HashMap::new();
+        conditions.insert("allowed_tools".into(), serde_json::json!(["search"]));
+
+        let rule = PolicyRule::new(
+            "tool_policy".into(),
+            PolicyType::ToolAccess,
+            conditions,
+            vec!["allow".into()],
+            "Test policy".into(),
+        )
+        .unwrap();
+
+        let mut engine = PolicyEngine::new();
+        engine.add_rule(rule);
+
+        let node = GraphNode::new(
+            "n1".into(),
+            NodeType::ToolCall,
+            HashMap::new(),
+            Determinism::Deterministic,
+            vec![],
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let mut transcript = ExecutionTranscript::new("t".into(), "h".into(), 0);
+        assert!(matches!(
+            engine.enforce_node(&node, &mut transcript),
+            Err(DioError::PolicyViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn test_cost_ceiling_blocks_expensive_graph() {
+        let mut conditions = HashMap::new();
+        conditions.insert("max_cost".into(), serde_json::json!(10.0));
+
+        let rule = PolicyRule::new(
+            "cost_policy".into(),
+            PolicyType::CostCeiling,
+            conditions,
+            vec!["deny".into()],
+            "Cost ceiling".into(),
+        )
+        .unwrap();
+
+        let mut engine = PolicyEngine::new();
+        engine.add_rule(rule);
+
+        let mut metadata = HashMap::new();
+        metadata.insert("estimated_cost".into(), serde_json::json!(11.0));
+        let graph = ExecutionGraph::new(
+            vec![node("n1", NodeType::Output, &[])],
+            metadata,
+            "1.0".into(),
+        )
+        .unwrap();
+        let mut transcript = ExecutionTranscript::new("t".into(), graph.hash(), 0);
+
+        assert!(matches!(
+            engine.enforce_graph(&graph, &mut transcript),
+            Err(DioError::PolicyViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn test_resource_limit_max_nodes_is_enforced() {
+        let mut conditions = HashMap::new();
+        conditions.insert("max_nodes".into(), serde_json::json!(1));
+
+        let rule = PolicyRule::new(
+            "resource_policy".into(),
+            PolicyType::ResourceLimits,
+            conditions,
+            vec!["deny".into()],
+            "Resource limit".into(),
+        )
+        .unwrap();
+
+        let mut engine = PolicyEngine::new();
+        engine.add_rule(rule);
+
+        let graph = ExecutionGraph::new(
+            vec![
+                node("n1", NodeType::Output, &[]),
+                node("n2", NodeType::Output, &[]),
+            ],
+            HashMap::new(),
+            "1.0".into(),
+        )
+        .unwrap();
+        let mut transcript = ExecutionTranscript::new("t".into(), graph.hash(), 0);
+
+        assert!(matches!(
+            engine.enforce_graph(&graph, &mut transcript),
+            Err(DioError::PolicyViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn test_human_approval_policy_blocks_unapproved_graph() {
+        let mut conditions = HashMap::new();
+        conditions.insert("required".into(), serde_json::json!(true));
+
+        let rule = PolicyRule::new(
+            "approval_policy".into(),
+            PolicyType::HumanApproval,
+            conditions,
+            vec!["deny".into()],
+            "Approval gate".into(),
+        )
+        .unwrap();
+
+        let mut engine = PolicyEngine::new();
+        engine.add_rule(rule);
+
+        let graph = ExecutionGraph::new(
+            vec![node("n1", NodeType::Output, &[])],
+            HashMap::new(),
+            "1.0".into(),
+        )
+        .unwrap();
+        let mut transcript = ExecutionTranscript::new("t".into(), graph.hash(), 0);
+
+        assert!(matches!(
+            engine.enforce_graph(&graph, &mut transcript),
+            Err(DioError::PolicyViolation { .. })
+        ));
+    }
+
+    #[test]
     fn test_orchestrator_full_lifecycle() {
         let engine = PolicyEngine::new();
         let orchestrator = IntelligenceOrchestrator::new(engine, 100);
@@ -1369,18 +1751,19 @@ mod tests {
         let n2 = node("process", NodeType::ModelCall, &["input"]);
         let n3 = node("output", NodeType::Output, &["process"]);
 
-        let graph = ExecutionGraph::new(
-            vec![n1, n2, n3],
-            HashMap::new(),
-            "1.0".into(),
-        )
-        .unwrap();
+        let graph = ExecutionGraph::new(vec![n1, n2, n3], HashMap::new(), "1.0".into()).unwrap();
 
         let exec_id = orchestrator.submit_graph(graph).unwrap();
-        assert_eq!(orchestrator.status(&exec_id), Some(ExecutionStatus::Pending));
+        assert_eq!(
+            orchestrator.status(&exec_id),
+            Some(ExecutionStatus::Pending)
+        );
 
         let transcript = orchestrator.execute(&exec_id).unwrap();
-        assert_eq!(orchestrator.status(&exec_id), Some(ExecutionStatus::Completed));
+        assert_eq!(
+            orchestrator.status(&exec_id),
+            Some(ExecutionStatus::Completed)
+        );
 
         // Verify integrity
         assert!(orchestrator.verify(&exec_id).unwrap());
@@ -1397,7 +1780,10 @@ mod tests {
         let mut engine = PolicyEngine::new();
 
         let mut conditions = HashMap::new();
-        conditions.insert("allowed_models".into(), serde_json::json!(["allowed-model"]));
+        conditions.insert(
+            "allowed_models".into(),
+            serde_json::json!(["allowed-model"]),
+        );
         engine.add_rule(
             PolicyRule::new(
                 "strict".into(),
@@ -1435,15 +1821,63 @@ mod tests {
     #[test]
     fn test_node_id_validation() {
         // Valid IDs
-        assert!(GraphNode::new("valid_id".into(), NodeType::Output, HashMap::new(), Determinism::Deterministic, vec![], HashMap::new()).is_ok());
-        assert!(GraphNode::new("valid-id".into(), NodeType::Output, HashMap::new(), Determinism::Deterministic, vec![], HashMap::new()).is_ok());
-        assert!(GraphNode::new("ValidId123".into(), NodeType::Output, HashMap::new(), Determinism::Deterministic, vec![], HashMap::new()).is_ok());
+        assert!(GraphNode::new(
+            "valid_id".into(),
+            NodeType::Output,
+            HashMap::new(),
+            Determinism::Deterministic,
+            vec![],
+            HashMap::new()
+        )
+        .is_ok());
+        assert!(GraphNode::new(
+            "valid-id".into(),
+            NodeType::Output,
+            HashMap::new(),
+            Determinism::Deterministic,
+            vec![],
+            HashMap::new()
+        )
+        .is_ok());
+        assert!(GraphNode::new(
+            "ValidId123".into(),
+            NodeType::Output,
+            HashMap::new(),
+            Determinism::Deterministic,
+            vec![],
+            HashMap::new()
+        )
+        .is_ok());
 
         // Invalid: empty
-        assert!(GraphNode::new("".into(), NodeType::Output, HashMap::new(), Determinism::Deterministic, vec![], HashMap::new()).is_err());
+        assert!(GraphNode::new(
+            "".into(),
+            NodeType::Output,
+            HashMap::new(),
+            Determinism::Deterministic,
+            vec![],
+            HashMap::new()
+        )
+        .is_err());
 
         // Invalid: special characters
-        assert!(GraphNode::new("invalid id".into(), NodeType::Output, HashMap::new(), Determinism::Deterministic, vec![], HashMap::new()).is_err());
-        assert!(GraphNode::new("invalid/id".into(), NodeType::Output, HashMap::new(), Determinism::Deterministic, vec![], HashMap::new()).is_err());
+        assert!(GraphNode::new(
+            "invalid id".into(),
+            NodeType::Output,
+            HashMap::new(),
+            Determinism::Deterministic,
+            vec![],
+            HashMap::new()
+        )
+        .is_err());
+        assert!(GraphNode::new(
+            "invalid/id".into(),
+            NodeType::Output,
+            HashMap::new(),
+            Determinism::Deterministic,
+            vec![],
+            HashMap::new()
+        )
+        .is_err());
     }
 }
