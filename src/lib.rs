@@ -146,6 +146,8 @@ pub enum EntryType {
     Completion,
     /// A policy rule was violated.
     PolicyViolation,
+    /// A policy rule explicitly authorized an operation.
+    PolicyDecision,
 }
 
 impl std::fmt::Display for EntryType {
@@ -158,6 +160,7 @@ impl std::fmt::Display for EntryType {
             Self::Failure => write!(f, "failure"),
             Self::Completion => write!(f, "completion"),
             Self::PolicyViolation => write!(f, "policy_violation"),
+            Self::PolicyDecision => write!(f, "policy_decision"),
         }
     }
 }
@@ -244,28 +247,95 @@ impl GraphNode {
         dependencies: Vec<String>,
         metadata: HashMap<String, serde_json::Value>,
     ) -> DioResult<Self> {
-        if id.is_empty() {
-            return Err(DioError::Validation("Node ID cannot be empty".into()));
-        }
-        // Validate ID format (alphanumeric + underscore)
-        if !id
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
-        {
-            return Err(DioError::Validation(format!(
-                "Node ID '{}' contains invalid characters",
-                id
-            )));
-        }
-
-        Ok(Self {
+        let node = Self {
             id,
             node_type,
             data,
             determinism,
             dependencies,
             metadata,
-        })
+        };
+        node.validate()?;
+        Ok(node)
+    }
+
+    /// Validates a node, including instances created through deserialization.
+    pub fn validate(&self) -> DioResult<()> {
+        if self.id.trim().is_empty() {
+            return Err(DioError::Validation("Node ID cannot be empty".into()));
+        }
+        if !self
+            .id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(DioError::Validation(format!(
+                "Node ID '{}' contains invalid characters",
+                self.id
+            )));
+        }
+
+        let mut dependencies = HashSet::new();
+        for dependency in &self.dependencies {
+            if dependency.trim().is_empty()
+                || !dependency
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                return Err(DioError::Validation(format!(
+                    "Node '{}' has invalid dependency ID '{}'",
+                    self.id, dependency
+                )));
+            }
+            if !dependencies.insert(dependency) {
+                return Err(DioError::Validation(format!(
+                    "Node '{}' has duplicate dependency '{}'",
+                    self.id, dependency
+                )));
+            }
+        }
+
+        for key in ["tokens", "time_seconds", "retry_count"] {
+            if let Some(value) = self.data.get(key) {
+                if value.as_u64().is_none() {
+                    return Err(DioError::Validation(format!(
+                        "Node '{}' field '{}' must be a non-negative integer",
+                        self.id, key
+                    )));
+                }
+            }
+        }
+
+        for key in ["cost", "estimated_cost"] {
+            if let Some(value) = self.data.get(key) {
+                let Some(cost) = value.as_f64() else {
+                    return Err(DioError::Validation(format!(
+                        "Node '{}' field '{}' must be numeric",
+                        self.id, key
+                    )));
+                };
+                if !cost.is_finite() || cost < 0.0 {
+                    return Err(DioError::Validation(format!(
+                        "Node '{}' field '{}' must be finite and non-negative",
+                        self.id, key
+                    )));
+                }
+            }
+        }
+
+        if let Some(egress_domain) = self.data.get("egress_domain") {
+            if egress_domain
+                .as_str()
+                .is_none_or(|domain| domain.trim().is_empty())
+            {
+                return Err(DioError::Validation(format!(
+                    "Node '{}' field 'egress_domain' must be a non-empty string",
+                    self.id
+                )));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -291,24 +361,13 @@ impl ExecutionGraph {
         metadata: HashMap<String, serde_json::Value>,
         version: String,
     ) -> DioResult<Self> {
-        if nodes.is_empty() {
-            return Err(DioError::Graph(
-                "Graph must contain at least one node".into(),
-            ));
-        }
-
-        let mut seen_ids = HashSet::new();
-        for node in &nodes {
-            if !seen_ids.insert(&node.id) {
-                return Err(DioError::Graph(format!("Duplicate node ID: {}", node.id)));
-            }
-        }
-
-        Ok(Self {
+        let graph = Self {
             nodes,
             metadata,
             version,
-        })
+        };
+        graph.validate()?;
+        Ok(graph)
     }
 
     /// Deterministic hash: sorts nodes by ID, sorts all map keys
@@ -357,6 +416,43 @@ impl ExecutionGraph {
 
     /// Validate: no cycles, no missing deps. Returns detailed error.
     pub fn validate(&self) -> DioResult<()> {
+        if self.nodes.is_empty() {
+            return Err(DioError::Graph(
+                "Graph must contain at least one node".into(),
+            ));
+        }
+        if self.version != "1.0" {
+            return Err(DioError::Graph(format!(
+                "Unsupported graph version '{}'; expected '1.0'",
+                self.version
+            )));
+        }
+
+        let mut seen_ids = HashSet::new();
+        for node in &self.nodes {
+            node.validate()?;
+            if !seen_ids.insert(node.id.as_str()) {
+                return Err(DioError::Graph(format!("Duplicate node ID: {}", node.id)));
+            }
+        }
+
+        for key in ["cost", "estimated_cost"] {
+            if let Some(value) = self.metadata.get(key) {
+                let Some(cost) = value.as_f64() else {
+                    return Err(DioError::Graph(format!(
+                        "Graph field '{}' must be numeric",
+                        key
+                    )));
+                };
+                if !cost.is_finite() || cost < 0.0 {
+                    return Err(DioError::Graph(format!(
+                        "Graph field '{}' must be finite and non-negative",
+                        key
+                    )));
+                }
+            }
+        }
+
         let node_ids: HashSet<_> = self.nodes.iter().map(|n| n.id.as_str()).collect();
 
         // Check missing dependencies
@@ -473,89 +569,160 @@ impl PolicyRule {
         description: String,
         priority: u32,
     ) -> DioResult<Self> {
-        if id.is_empty() {
-            return Err(DioError::Validation("Policy ID cannot be empty".into()));
-        }
-        if actions.is_empty() {
-            return Err(DioError::Validation(
-                "Policy must have at least one action".into(),
-            ));
-        }
-        if conditions.is_empty() {
-            return Err(DioError::Validation("Policy must have conditions".into()));
-        }
-
-        // Type-specific validation
-        match policy_type {
-            PolicyType::ModelAccess => {
-                let allowed = conditions.get("allowed_models");
-                if !matches!(allowed, Some(v) if v.is_array()) {
-                    return Err(DioError::Validation(
-                        "MODEL_ACCESS requires 'allowed_models' array".into(),
-                    ));
-                }
-            }
-            PolicyType::ToolAccess => {
-                let allowed = conditions.get("allowed_tools");
-                if !matches!(allowed, Some(v) if v.is_array()) {
-                    return Err(DioError::Validation(
-                        "TOOL_ACCESS requires 'allowed_tools' array".into(),
-                    ));
-                }
-            }
-            PolicyType::CostCeiling => {
-                let max_cost = conditions.get("max_cost");
-                if !matches!(max_cost, Some(v) if v.is_number()) {
-                    return Err(DioError::Validation(
-                        "COST_CEILING requires numeric 'max_cost'".into(),
-                    ));
-                }
-            }
-            PolicyType::ResourceLimits => {
-                let has_limit = ["max_nodes", "max_tokens", "max_time_seconds", "max_retries"]
-                    .iter()
-                    .any(|k| conditions.contains_key(*k));
-                if !has_limit {
-                    return Err(DioError::Validation(
-                        "RESOURCE_LIMITS requires at least one limit".into(),
-                    ));
-                }
-            }
-            PolicyType::DataEgress => {
-                let allowed = conditions.get("allowed_domains");
-                if !matches!(allowed, Some(v) if v.is_array()) {
-                    return Err(DioError::Validation(
-                        "DATA_EGRESS requires 'allowed_domains' array".into(),
-                    ));
-                }
-            }
-            PolicyType::RetryBehavior => {
-                let max_retries = conditions.get("max_retries");
-                if !matches!(max_retries, Some(v) if v.is_number()) {
-                    return Err(DioError::Validation(
-                        "RETRY_BEHAVIOR requires numeric 'max_retries'".into(),
-                    ));
-                }
-            }
-            PolicyType::SideEffects => {
-                let allowed = conditions.get("allowed_side_effects");
-                if !matches!(allowed, Some(v) if v.is_array()) {
-                    return Err(DioError::Validation(
-                        "SIDE_EFFECTS requires 'allowed_side_effects' array".into(),
-                    ));
-                }
-            }
-            _ => {}
-        }
-
-        Ok(Self {
+        let rule = Self {
             id,
             policy_type,
             conditions,
             actions,
             description,
             priority,
-        })
+        };
+        rule.validate()?;
+        Ok(rule)
+    }
+
+    /// Validates a rule, including instances created through deserialization.
+    pub fn validate(&self) -> DioResult<()> {
+        if self.id.trim().is_empty()
+            || !self
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(DioError::Validation(format!(
+                "Policy ID '{}' is invalid",
+                self.id
+            )));
+        }
+        if self.conditions.is_empty() {
+            return Err(DioError::Validation("Policy must have conditions".into()));
+        }
+        if self.actions.is_empty() {
+            return Err(DioError::Validation(
+                "Policy must have at least one action".into(),
+            ));
+        }
+
+        let expected_action = match self.policy_type {
+            PolicyType::ModelAccess
+            | PolicyType::ToolAccess
+            | PolicyType::DataEgress
+            | PolicyType::SideEffects => "allow",
+            PolicyType::ResourceLimits
+            | PolicyType::RetryBehavior
+            | PolicyType::CostCeiling
+            | PolicyType::HumanApproval => "deny",
+        };
+        let mut actions = HashSet::new();
+        for action in &self.actions {
+            if action != expected_action || !actions.insert(action.as_str()) {
+                return Err(DioError::Validation(format!(
+                    "Policy '{}' requires exactly the '{}' action",
+                    self.id, expected_action
+                )));
+            }
+        }
+
+        let validate_string_array = |key: &str| -> DioResult<()> {
+            let Some(values) = self.conditions.get(key).and_then(|v| v.as_array()) else {
+                return Err(DioError::Validation(format!(
+                    "Policy '{}' requires '{}' array",
+                    self.id, key
+                )));
+            };
+            if values
+                .iter()
+                .any(|value| value.as_str().is_none_or(|text| text.trim().is_empty()))
+            {
+                return Err(DioError::Validation(format!(
+                    "Policy '{}' field '{}' must contain only non-empty strings",
+                    self.id, key
+                )));
+            }
+            Ok(())
+        };
+
+        match self.policy_type {
+            PolicyType::ModelAccess => validate_string_array("allowed_models")?,
+            PolicyType::ToolAccess => validate_string_array("allowed_tools")?,
+            PolicyType::CostCeiling => {
+                let Some(max_cost) = self.conditions.get("max_cost").and_then(|v| v.as_f64())
+                else {
+                    return Err(DioError::Validation(
+                        "COST_CEILING requires numeric 'max_cost'".into(),
+                    ));
+                };
+                if !max_cost.is_finite() || max_cost < 0.0 {
+                    return Err(DioError::Validation(
+                        "COST_CEILING 'max_cost' must be finite and non-negative".into(),
+                    ));
+                }
+            }
+            PolicyType::ResourceLimits => {
+                let limit_keys = ["max_nodes", "max_tokens", "max_time_seconds", "max_retries"];
+                if !limit_keys
+                    .iter()
+                    .any(|key| self.conditions.contains_key(*key))
+                {
+                    return Err(DioError::Validation(
+                        "RESOURCE_LIMITS requires at least one limit".into(),
+                    ));
+                }
+                for key in limit_keys {
+                    if self
+                        .conditions
+                        .get(key)
+                        .is_some_and(|value| value.as_u64().is_none())
+                    {
+                        return Err(DioError::Validation(format!(
+                            "RESOURCE_LIMITS '{}' must be a non-negative integer",
+                            key
+                        )));
+                    }
+                }
+            }
+            PolicyType::DataEgress => validate_string_array("allowed_domains")?,
+            PolicyType::RetryBehavior => {
+                if self
+                    .conditions
+                    .get("max_retries")
+                    .and_then(|value| value.as_u64())
+                    .is_none()
+                {
+                    return Err(DioError::Validation(
+                        "RETRY_BEHAVIOR requires non-negative integer 'max_retries'".into(),
+                    ));
+                }
+            }
+            PolicyType::SideEffects => validate_string_array("allowed_side_effects")?,
+            PolicyType::HumanApproval => {
+                if self
+                    .conditions
+                    .get("required")
+                    .is_some_and(|value| value.as_bool().is_none())
+                {
+                    return Err(DioError::Validation(
+                        "HUMAN_APPROVAL 'required' must be boolean".into(),
+                    ));
+                }
+                if self.conditions.contains_key("approved_graph_hashes") {
+                    validate_string_array("approved_graph_hashes")?;
+                    let hashes = self.conditions["approved_graph_hashes"]
+                        .as_array()
+                        .expect("validated array");
+                    if hashes.iter().any(|value| {
+                        let hash = value.as_str().expect("validated string");
+                        hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    }) {
+                        return Err(DioError::Validation(
+                            "HUMAN_APPROVAL graph hashes must be SHA-256 hex strings".into(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -672,9 +839,14 @@ pub struct ExecutionTranscript {
     next_sequence: u64,
     chain_head: String,
     /// Cryptographic signature of the transcript (optional).
+    #[serde(default)]
     pub signature: Option<String>,
     /// Hash representing the determinism classification of executed nodes.
+    #[serde(default)]
     pub determinism_hash: Option<String>,
+    /// Hash of the immutable policy snapshot used for this run.
+    #[serde(default)]
+    pub policy_hash: Option<String>,
 }
 
 impl ExecutionTranscript {
@@ -689,6 +861,7 @@ impl ExecutionTranscript {
             chain_head: "genesis".into(),
             signature: None,
             determinism_hash: None,
+            policy_hash: None,
         }
     }
 
@@ -710,6 +883,7 @@ impl ExecutionTranscript {
         self.chain_head = entry.hash();
         self.next_sequence += 1;
         self.entries.push(entry);
+        self.signature = None;
     }
 
     /// Returns a slice of all transcript entries.
@@ -720,7 +894,19 @@ impl ExecutionTranscript {
     /// Verify: sequence continuity, timestamp ordering, chain integrity
     pub fn verify_integrity(&self) -> DioResult<()> {
         if self.entries.is_empty() {
+            if self.next_sequence != 0 || self.chain_head != "genesis" {
+                return Err(DioError::Integrity(
+                    "Empty transcript has inconsistent chain state".into(),
+                ));
+            }
             return Ok(());
+        }
+        if self.next_sequence != self.entries.len() as u64 {
+            return Err(DioError::Integrity(format!(
+                "Next sequence mismatch: expected {}, got {}",
+                self.entries.len(),
+                self.next_sequence
+            )));
         }
 
         let mut expected_prev = "genesis".to_string();
@@ -738,6 +924,12 @@ impl ExecutionTranscript {
             if i > 0 && entry.timestamp < self.entries[i - 1].timestamp {
                 return Err(DioError::Integrity(format!(
                     "Timestamp regression at sequence {}",
+                    i
+                )));
+            }
+            if entry.timestamp < self.created_at {
+                return Err(DioError::Integrity(format!(
+                    "Entry timestamp predates transcript at sequence {}",
                     i
                 )));
             }
@@ -769,14 +961,19 @@ impl ExecutionTranscript {
 
     /// Computes the cryptographic hash of the transcript state.
     pub fn hash(&self) -> String {
+        let canonical = serde_json::json!({
+            "execution_id": self.execution_id,
+            "graph_hash": self.graph_hash,
+            "created_at": self.created_at,
+            "next_sequence": self.next_sequence,
+            "chain_head": self.chain_head,
+            "determinism_hash": self.determinism_hash,
+            "policy_hash": self.policy_hash,
+        });
         let mut hasher = Sha256::new();
-        hasher.update(self.execution_id.as_bytes());
-        hasher.update(self.graph_hash.as_bytes());
-        hasher.update(self.created_at.to_le_bytes());
-        hasher.update(self.chain_head.as_bytes());
-        if let Some(dh) = &self.determinism_hash {
-            hasher.update(dh.as_bytes());
-        }
+        hasher.update(
+            serde_json::to_vec(&canonical).expect("transcript state contains only JSON values"),
+        );
         format!("{:x}", hasher.finalize())
     }
 
@@ -794,11 +991,33 @@ impl ExecutionTranscript {
         let Some(sig) = &self.signature else {
             return false;
         };
+        if self.verify_integrity().is_err() || sig.len() != 64 {
+            return false;
+        }
+        let mut expected = [0_u8; 32];
+        for (index, chunk) in sig.as_bytes().chunks_exact(2).enumerate() {
+            let Some(high) = Self::hex_nibble(chunk[0]) else {
+                return false;
+            };
+            let Some(low) = Self::hex_nibble(chunk[1]) else {
+                return false;
+            };
+            expected[index] = (high << 4) | low;
+        }
         use hmac::{Hmac, Mac};
         type HmacSha256 = Hmac<Sha256>;
         let mut mac = HmacSha256::new_from_slice(key).expect("valid key");
         mac.update(self.hash().as_bytes());
-        format!("{:x}", mac.finalize().into_bytes()) == *sig
+        mac.verify_slice(&expected).is_ok()
+    }
+
+    fn hex_nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
     }
 }
 
@@ -824,6 +1043,8 @@ pub struct ExecutionContext {
     /// Error message if execution failed.
     pub error: Option<String>,
     node_results: HashMap<String, serde_json::Value>,
+    policy_snapshot: PolicyEngine,
+    policy_hash: String,
 }
 
 // =============================================================================
@@ -831,7 +1052,7 @@ pub struct ExecutionContext {
 // =============================================================================
 
 /// Evaluates governance rules against graphs and nodes.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PolicyEngine {
     rules: Vec<PolicyRule>,
 }
@@ -842,15 +1063,86 @@ impl PolicyEngine {
         Self::default()
     }
 
-    /// Adds a policy rule and sorts by priority.
+    /// Adds or replaces a policy rule by ID and sorts by priority.
     pub fn add_rule(&mut self, rule: PolicyRule) {
-        self.rules.push(rule);
-        self.rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+        if let Some(existing) = self
+            .rules
+            .iter_mut()
+            .find(|existing| existing.id == rule.id)
+        {
+            *existing = rule;
+        } else {
+            self.rules.push(rule);
+        }
+        self.rules.sort_by(|left, right| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    }
+
+    /// Validates and adds a policy rule.
+    pub fn try_add_rule(&mut self, rule: PolicyRule) -> DioResult<()> {
+        rule.validate()?;
+        if self.rules.iter().any(|existing| existing.id == rule.id) {
+            return Err(DioError::Validation(format!(
+                "Duplicate policy ID: {}",
+                rule.id
+            )));
+        }
+        self.add_rule(rule);
+        Ok(())
     }
 
     /// Returns a slice of all registered rules.
     pub fn rules(&self) -> &[PolicyRule] {
         &self.rules
+    }
+
+    /// Validates the complete policy set at an enforcement boundary.
+    pub fn validate(&self) -> DioResult<()> {
+        let mut ids = HashSet::new();
+        for rule in &self.rules {
+            rule.validate()?;
+            if !ids.insert(rule.id.as_str()) {
+                return Err(DioError::Validation(format!(
+                    "Duplicate policy ID: {}",
+                    rule.id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Computes a deterministic hash of the complete policy set.
+    pub fn hash(&self) -> DioResult<String> {
+        self.validate()?;
+        let mut rules = self.rules.clone();
+        rules.sort_by(|left, right| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let canonical: Vec<_> = rules
+            .iter()
+            .map(|rule| {
+                serde_json::json!({
+                    "id": rule.id,
+                    "type": rule.policy_type.to_string(),
+                    "conditions": ExecutionGraph::sorted_map(&rule.conditions),
+                    "actions": rule.actions,
+                    "description": rule.description,
+                    "priority": rule.priority,
+                })
+            })
+            .collect();
+        let bytes = serde_json::to_vec(&canonical)
+            .map_err(|error| DioError::Integrity(format!("Policy hashing failed: {}", error)))?;
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        Ok(format!("{:x}", hasher.finalize()))
     }
 
     /// Enforces graph-level policies before execution begins.
@@ -859,6 +1151,9 @@ impl PolicyEngine {
         graph: &ExecutionGraph,
         transcript: &mut ExecutionTranscript,
     ) -> DioResult<()> {
+        self.validate()?;
+        graph.validate()?;
+
         for rule in &self.rules {
             match rule.policy_type {
                 PolicyType::ResourceLimits => {
@@ -871,34 +1166,184 @@ impl PolicyEngine {
                             );
                         }
                     }
-                }
-                PolicyType::CostCeiling => {
-                    if let Some(max) = rule.conditions.get("max_cost").and_then(|v| v.as_f64()) {
-                        let estimated_cost = graph
-                            .metadata
-                            .get("estimated_cost")
-                            .or_else(|| graph.metadata.get("cost"))
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or_else(|| {
-                                graph
-                                    .nodes
-                                    .iter()
-                                    .filter_map(|node| {
-                                        node.data
-                                            .get("estimated_cost")
-                                            .or_else(|| node.data.get("cost"))
-                                            .and_then(|v| v.as_f64())
-                                    })
-                                    .sum()
-                            });
-                        if estimated_cost > max {
+
+                    if let Some(max) = rule.conditions.get("max_tokens").and_then(|v| v.as_u64()) {
+                        let mut total = 0_u64;
+                        for node in &graph.nodes {
+                            let actual = node.data.get("tokens").and_then(|value| value.as_u64());
+                            if node.node_type == NodeType::ModelCall && actual.is_none() {
+                                return self.violation(
+                                    rule,
+                                    transcript,
+                                    format!("Node '{}' must declare token usage", node.id),
+                                );
+                            }
+                            if let Some(actual) = actual {
+                                let Some(next) = total.checked_add(actual) else {
+                                    return self.violation(
+                                        rule,
+                                        transcript,
+                                        "Total token usage overflowed".into(),
+                                    );
+                                };
+                                total = next;
+                            }
+                        }
+                        if total > max {
                             return self.violation(
                                 rule,
                                 transcript,
-                                format!("Estimated cost {} exceeds max {}", estimated_cost, max),
+                                format!("Total tokens {} exceeds max {}", total, max),
                             );
                         }
                     }
+
+                    if let Some(max) = rule
+                        .conditions
+                        .get("max_time_seconds")
+                        .and_then(|v| v.as_u64())
+                    {
+                        let mut total = 0_u64;
+                        for node in &graph.nodes {
+                            let Some(actual) = node
+                                .data
+                                .get("time_seconds")
+                                .and_then(|value| value.as_u64())
+                            else {
+                                return self.violation(
+                                    rule,
+                                    transcript,
+                                    format!("Node '{}' must declare execution time", node.id),
+                                );
+                            };
+                            let Some(next) = total.checked_add(actual) else {
+                                return self.violation(
+                                    rule,
+                                    transcript,
+                                    "Total execution time overflowed".into(),
+                                );
+                            };
+                            total = next;
+                        }
+                        if total > max {
+                            return self.violation(
+                                rule,
+                                transcript,
+                                format!("Total time {} exceeds max {}", total, max),
+                            );
+                        }
+                    }
+
+                    if let Some(max) = rule.conditions.get("max_retries").and_then(|v| v.as_u64()) {
+                        let mut total = 0_u64;
+                        for node in graph
+                            .nodes
+                            .iter()
+                            .filter(|node| node.node_type == NodeType::Retry)
+                        {
+                            let Some(actual) = node
+                                .data
+                                .get("retry_count")
+                                .and_then(|value| value.as_u64())
+                            else {
+                                return self.violation(
+                                    rule,
+                                    transcript,
+                                    format!("Retry node '{}' must declare retry_count", node.id),
+                                );
+                            };
+                            let Some(next) = total.checked_add(actual) else {
+                                return self.violation(
+                                    rule,
+                                    transcript,
+                                    "Total retry count overflowed".into(),
+                                );
+                            };
+                            total = next;
+                        }
+                        if total > max {
+                            return self.violation(
+                                rule,
+                                transcript,
+                                format!("Total retries {} exceeds max {}", total, max),
+                            );
+                        }
+                    }
+
+                    self.decision(rule, transcript, "graph", None);
+                }
+                PolicyType::CostCeiling => {
+                    let max = rule.conditions["max_cost"]
+                        .as_f64()
+                        .expect("validated max_cost");
+                    let mut node_total = 0.0_f64;
+                    let mut compensation = 0.0_f64;
+                    let mut nodes: Vec<_> = graph.nodes.iter().collect();
+                    nodes.sort_by(|left, right| left.id.cmp(&right.id));
+                    for node in nodes {
+                        let declared = ["cost", "estimated_cost"]
+                            .iter()
+                            .filter_map(|key| node.data.get(*key).and_then(|value| value.as_f64()))
+                            .fold(None, |current: Option<f64>, value| {
+                                Some(current.map_or(value, |prior| prior.max(value)))
+                            });
+                        let Some(declared) = declared else {
+                            return self.violation(
+                                rule,
+                                transcript,
+                                format!("Node '{}' must declare a non-negative cost", node.id),
+                            );
+                        };
+                        // Neumaier summation preserves small positive costs that
+                        // ordinary f64 addition can otherwise round away.
+                        let next = node_total + declared;
+                        compensation += if node_total.abs() >= declared.abs() {
+                            (node_total - next) + declared
+                        } else {
+                            (declared - next) + node_total
+                        };
+                        node_total = next;
+                        if !node_total.is_finite() || !compensation.is_finite() {
+                            return self.violation(
+                                rule,
+                                transcript,
+                                "Total declared cost overflowed".into(),
+                            );
+                        }
+                    }
+                    let combined = node_total + compensation;
+                    let compensation_virtual = combined - node_total;
+                    let residual = (node_total - (combined - compensation_virtual))
+                        + (compensation - compensation_virtual);
+                    node_total = if residual > 0.0 {
+                        f64::from_bits(combined.to_bits() + 1)
+                    } else {
+                        combined
+                    };
+                    if !node_total.is_finite() {
+                        return self.violation(
+                            rule,
+                            transcript,
+                            "Total declared cost overflowed".into(),
+                        );
+                    }
+
+                    let graph_cost = ["cost", "estimated_cost"]
+                        .iter()
+                        .filter_map(|key| graph.metadata.get(*key).and_then(|value| value.as_f64()))
+                        .fold(None, |current: Option<f64>, value| {
+                            Some(current.map_or(value, |prior| prior.max(value)))
+                        })
+                        .unwrap_or(0.0);
+                    let estimated_cost = node_total.max(graph_cost);
+                    if estimated_cost > max {
+                        return self.violation(
+                            rule,
+                            transcript,
+                            format!("Estimated cost {} exceeds max {}", estimated_cost, max),
+                        );
+                    }
+                    self.decision(rule, transcript, "graph", None);
                 }
                 PolicyType::HumanApproval => {
                     let required = rule
@@ -906,18 +1351,24 @@ impl PolicyEngine {
                         .get("required")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(true);
-                    let approved = graph
-                        .metadata
-                        .get("human_approved")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
+                    let graph_hash = graph.hash();
+                    let approved = rule
+                        .conditions
+                        .get("approved_graph_hashes")
+                        .and_then(|value| value.as_array())
+                        .is_some_and(|hashes| {
+                            hashes
+                                .iter()
+                                .any(|value| value.as_str() == Some(graph_hash.as_str()))
+                        });
                     if required && !approved {
                         return self.violation(
                             rule,
                             transcript,
-                            "Human approval is required before execution".into(),
+                            format!("Graph hash '{}' has no trusted human approval", graph_hash),
                         );
                     }
+                    self.decision(rule, transcript, "graph", None);
                 }
                 _ => {}
             }
@@ -931,19 +1382,45 @@ impl PolicyEngine {
         node: &GraphNode,
         transcript: &mut ExecutionTranscript,
     ) -> DioResult<()> {
+        self.validate()?;
+        node.validate()?;
+
+        let governed_access = match node.node_type {
+            NodeType::ModelCall => Some((PolicyType::ModelAccess, "model_name", "model")),
+            NodeType::ToolCall => Some((PolicyType::ToolAccess, "tool_name", "tool")),
+            NodeType::SideEffect => Some((PolicyType::SideEffects, "effect_type", "side effect")),
+            _ => None,
+        };
+        let governed_value = if let Some((policy_type, key, label)) = governed_access {
+            let Some(value) = node.data.get(key).and_then(|value| value.as_str()) else {
+                return self.default_violation(
+                    policy_type,
+                    transcript,
+                    format!("Node '{}' must declare its {}", node.id, label),
+                    Some(&node.id),
+                );
+            };
+            if value.trim().is_empty() {
+                return self.default_violation(
+                    policy_type,
+                    transcript,
+                    format!("Node '{}' has an empty {}", node.id, label),
+                    Some(&node.id),
+                );
+            }
+            Some(value)
+        } else {
+            None
+        };
+        let mut explicitly_authorized = false;
+
         for rule in &self.rules {
             match rule.policy_type {
                 PolicyType::ModelAccess if node.node_type == NodeType::ModelCall => {
-                    let Some(model) = node.data.get("model_name").and_then(|v| v.as_str()) else {
-                        return self.violation(rule, transcript, "Model name is required".into());
-                    };
-                    let Some(allowed) = rule
-                        .conditions
-                        .get("allowed_models")
-                        .and_then(|v| v.as_array())
-                    else {
-                        continue;
-                    };
+                    let model = governed_value.expect("validated model name");
+                    let allowed = rule.conditions["allowed_models"]
+                        .as_array()
+                        .expect("validated allowed_models");
                     if !allowed.iter().any(|v| v.as_str() == Some(model)) {
                         return self.violation(
                             rule,
@@ -951,18 +1428,14 @@ impl PolicyEngine {
                             format!("Model '{}' not allowed", model),
                         );
                     }
+                    explicitly_authorized = true;
+                    self.decision(rule, transcript, "node", Some(&node.id));
                 }
                 PolicyType::ToolAccess if node.node_type == NodeType::ToolCall => {
-                    let Some(tool) = node.data.get("tool_name").and_then(|v| v.as_str()) else {
-                        return self.violation(rule, transcript, "Tool name is required".into());
-                    };
-                    let Some(allowed) = rule
-                        .conditions
-                        .get("allowed_tools")
-                        .and_then(|v| v.as_array())
-                    else {
-                        continue;
-                    };
+                    let tool = governed_value.expect("validated tool name");
+                    let allowed = rule.conditions["allowed_tools"]
+                        .as_array()
+                        .expect("validated allowed_tools");
                     if !allowed.iter().any(|v| v.as_str() == Some(tool)) {
                         return self.violation(
                             rule,
@@ -970,6 +1443,8 @@ impl PolicyEngine {
                             format!("Tool '{}' not allowed", tool),
                         );
                     }
+                    explicitly_authorized = true;
+                    self.decision(rule, transcript, "node", Some(&node.id));
                 }
                 PolicyType::ResourceLimits => {
                     for (node_key, limit_key) in [
@@ -977,29 +1452,58 @@ impl PolicyEngine {
                         ("time_seconds", "max_time_seconds"),
                         ("retry_count", "max_retries"),
                     ] {
-                        if let (Some(actual), Some(max)) = (
-                            node.data.get(node_key).and_then(|v| v.as_u64()),
-                            rule.conditions.get(limit_key).and_then(|v| v.as_u64()),
-                        ) {
-                            if actual > max {
-                                return self.violation(
-                                    rule,
-                                    transcript,
-                                    format!("{} {} exceeds max {}", node_key, actual, max),
-                                );
-                            }
-                        }
-                    }
-                }
-                PolicyType::DataEgress => {
-                    if let Some(domain) = node.data.get("egress_domain").and_then(|v| v.as_str()) {
-                        let Some(allowed) = rule
-                            .conditions
-                            .get("allowed_domains")
-                            .and_then(|v| v.as_array())
+                        let Some(max) = rule.conditions.get(limit_key).and_then(|v| v.as_u64())
                         else {
                             continue;
                         };
+                        let field_required = match node_key {
+                            "tokens" => node.node_type == NodeType::ModelCall,
+                            "time_seconds" => true,
+                            "retry_count" => node.node_type == NodeType::Retry,
+                            _ => false,
+                        };
+                        let actual = node.data.get(node_key).and_then(|v| v.as_u64());
+                        if field_required && actual.is_none() {
+                            return self.violation(
+                                rule,
+                                transcript,
+                                format!("Node '{}' must declare '{}'", node.id, node_key),
+                            );
+                        }
+                        if actual.is_some_and(|actual| actual > max) {
+                            return self.violation(
+                                rule,
+                                transcript,
+                                format!(
+                                    "{} {} exceeds max {}",
+                                    node_key,
+                                    actual.expect("present actual"),
+                                    max
+                                ),
+                            );
+                        }
+                    }
+                    self.decision(rule, transcript, "node", Some(&node.id));
+                }
+                PolicyType::DataEgress => {
+                    if matches!(
+                        node.node_type,
+                        NodeType::ModelCall | NodeType::ToolCall | NodeType::SideEffect
+                    ) {
+                        let Some(domain) = node
+                            .data
+                            .get("egress_domain")
+                            .and_then(|value| value.as_str())
+                        else {
+                            return self.violation(
+                                rule,
+                                transcript,
+                                format!("Node '{}' must declare egress_domain", node.id),
+                            );
+                        };
+                        let allowed = rule.conditions["allowed_domains"]
+                            .as_array()
+                            .expect("validated allowed_domains");
                         if !allowed.iter().any(|v| v.as_str() == Some(domain)) {
                             return self.violation(
                                 rule,
@@ -1007,37 +1511,38 @@ impl PolicyEngine {
                                 format!("Egress domain '{}' not allowed", domain),
                             );
                         }
+                        self.decision(rule, transcript, "node", Some(&node.id));
                     }
                 }
                 PolicyType::RetryBehavior if node.node_type == NodeType::Retry => {
-                    if let (Some(actual), Some(max)) = (
-                        node.data.get("retry_count").and_then(|v| v.as_u64()),
-                        rule.conditions.get("max_retries").and_then(|v| v.as_u64()),
-                    ) {
-                        if actual > max {
-                            return self.violation(
-                                rule,
-                                transcript,
-                                format!("Retry count {} exceeds max {}", actual, max),
-                            );
-                        }
-                    }
-                }
-                PolicyType::SideEffects if node.node_type == NodeType::SideEffect => {
-                    let Some(effect) = node.data.get("effect_type").and_then(|v| v.as_str()) else {
+                    let max = rule.conditions["max_retries"]
+                        .as_u64()
+                        .expect("validated max_retries");
+                    let Some(actual) = node
+                        .data
+                        .get("retry_count")
+                        .and_then(|value| value.as_u64())
+                    else {
                         return self.violation(
                             rule,
                             transcript,
-                            "Side effect type is required".into(),
+                            format!("Retry node '{}' must declare retry_count", node.id),
                         );
                     };
-                    let Some(allowed) = rule
-                        .conditions
-                        .get("allowed_side_effects")
-                        .and_then(|v| v.as_array())
-                    else {
-                        continue;
-                    };
+                    if actual > max {
+                        return self.violation(
+                            rule,
+                            transcript,
+                            format!("Retry count {} exceeds max {}", actual, max),
+                        );
+                    }
+                    self.decision(rule, transcript, "node", Some(&node.id));
+                }
+                PolicyType::SideEffects if node.node_type == NodeType::SideEffect => {
+                    let effect = governed_value.expect("validated side effect type");
+                    let allowed = rule.conditions["allowed_side_effects"]
+                        .as_array()
+                        .expect("validated allowed_side_effects");
                     if !allowed.iter().any(|v| v.as_str() == Some(effect)) {
                         return self.violation(
                             rule,
@@ -1045,11 +1550,93 @@ impl PolicyEngine {
                             format!("Side effect '{}' not allowed", effect),
                         );
                     }
+                    explicitly_authorized = true;
+                    self.decision(rule, transcript, "node", Some(&node.id));
                 }
                 _ => {}
             }
         }
+
+        if let Some((policy_type, _, label)) = governed_access {
+            if !explicitly_authorized {
+                return self.default_violation(
+                    policy_type,
+                    transcript,
+                    format!("Node '{}' has no explicit {} authorization", node.id, label),
+                    Some(&node.id),
+                );
+            }
+        }
         Ok(())
+    }
+
+    fn decision(
+        &self,
+        rule: &PolicyRule,
+        transcript: &mut ExecutionTranscript,
+        scope: &str,
+        node_id: Option<&str>,
+    ) {
+        let mut data = HashMap::new();
+        data.insert(
+            "policy_id".into(),
+            serde_json::Value::String(rule.id.clone()),
+        );
+        data.insert(
+            "policy_type".into(),
+            serde_json::Value::String(rule.policy_type.to_string()),
+        );
+        data.insert(
+            "outcome".into(),
+            serde_json::Value::String("authorized".into()),
+        );
+        data.insert("scope".into(), serde_json::Value::String(scope.to_string()));
+        if let Some(node_id) = node_id {
+            data.insert(
+                "node_id".into(),
+                serde_json::Value::String(node_id.to_string()),
+            );
+        }
+        transcript.add_entry(EntryType::PolicyDecision, data);
+    }
+
+    fn default_violation(
+        &self,
+        policy_type: PolicyType,
+        transcript: &mut ExecutionTranscript,
+        message: String,
+        node_id: Option<&str>,
+    ) -> DioResult<()> {
+        let mut data = HashMap::new();
+        data.insert(
+            "policy_id".into(),
+            serde_json::Value::String("default_deny".into()),
+        );
+        data.insert(
+            "policy_type".into(),
+            serde_json::Value::String(policy_type.to_string()),
+        );
+        data.insert("message".into(), serde_json::Value::String(message.clone()));
+        if let Some(node_id) = node_id {
+            data.insert(
+                "node_id".into(),
+                serde_json::Value::String(node_id.to_string()),
+            );
+        }
+        transcript.add_entry(EntryType::PolicyViolation, data);
+
+        let mut details = HashMap::new();
+        if let Some(node_id) = node_id {
+            details.insert(
+                "node_id".into(),
+                serde_json::Value::String(node_id.to_string()),
+            );
+        }
+        Err(DioError::PolicyViolation {
+            message,
+            policy_type,
+            details,
+        })
     }
 
     fn violation(
@@ -1103,6 +1690,17 @@ impl IntelligenceOrchestrator {
     /// Submit an execution graph for processing. Returns execution ID.
     pub fn submit_graph(&self, graph: ExecutionGraph) -> DioResult<String> {
         graph.validate()?;
+        if self.max_cached == 0 {
+            return Err(DioError::State(
+                "Execution cache capacity must be greater than zero".into(),
+            ));
+        }
+
+        let (policy_snapshot, policy_hash) = {
+            let engine = self.policy_engine.read();
+            engine.validate()?;
+            (engine.clone(), engine.hash()?)
+        };
 
         let execution_id = uuid::Uuid::new_v4().to_string();
         let timestamp = SystemTime::now()
@@ -1113,10 +1711,15 @@ impl IntelligenceOrchestrator {
         let graph_hash = graph.hash();
         let mut transcript =
             ExecutionTranscript::new(execution_id.clone(), graph_hash.clone(), timestamp);
+        transcript.policy_hash = Some(policy_hash.clone());
 
         // Record submission
         let mut data = HashMap::new();
         data.insert("graph_hash".into(), serde_json::Value::String(graph_hash));
+        data.insert(
+            "submission_policy_hash".into(),
+            serde_json::Value::String(policy_hash.clone()),
+        );
         transcript.add_entry(EntryType::Submission, data);
 
         let context = ExecutionContext {
@@ -1128,22 +1731,33 @@ impl IntelligenceOrchestrator {
             status: ExecutionStatus::Pending,
             error: None,
             node_results: HashMap::new(),
+            policy_snapshot,
+            policy_hash,
         };
 
-        // Enforce cache limit with LRU-style eviction
+        // Enforce cache capacity without evicting active work.
         let mut executions = self.executions.write();
-        if executions.len() >= self.max_cached {
+        while executions.len() >= self.max_cached {
             let to_remove: Option<String> = executions
                 .iter()
                 .filter(|(_, ctx)| {
                     ctx.status == ExecutionStatus::Completed
                         || ctx.status == ExecutionStatus::Failed
                 })
-                .min_by_key(|(_, ctx)| ctx.start_time)
+                .min_by(|(left_id, left), (right_id, right)| {
+                    left.start_time
+                        .cmp(&right.start_time)
+                        .then_with(|| left_id.cmp(right_id))
+                })
                 .map(|(id, _)| id.clone());
 
             if let Some(id) = to_remove {
                 executions.remove(&id);
+            } else {
+                return Err(DioError::State(format!(
+                    "Execution cache is full (capacity {})",
+                    self.max_cached
+                )));
             }
         }
 
@@ -1153,10 +1767,16 @@ impl IntelligenceOrchestrator {
 
     /// Execute a previously submitted graph. Returns the execution transcript.
     pub fn execute(&self, execution_id: &str) -> DioResult<ExecutionTranscript> {
-        // Validate state transition
-        {
-            let executions = self.executions.read();
-            let ctx = executions.get(execution_id).ok_or_else(|| {
+        // Claim the execution and bind the current policy set atomically. Policies
+        // added after submission but before execution must govern the run, while
+        // changes after this point cannot produce a mixed-policy execution.
+        let policy_snapshot = {
+            let policy_engine = self.policy_engine.read();
+            policy_engine.validate()?;
+            let snapshot = policy_engine.clone();
+            let policy_hash = policy_engine.hash()?;
+            let mut executions = self.executions.write();
+            let ctx = executions.get_mut(execution_id).ok_or_else(|| {
                 DioError::State(format!("Unknown execution ID: {}", execution_id))
             })?;
             if ctx.status != ExecutionStatus::Pending {
@@ -1165,29 +1785,42 @@ impl IntelligenceOrchestrator {
                     execution_id, ctx.status
                 )));
             }
-        }
+            ctx.status = ExecutionStatus::Running;
+            ctx.policy_snapshot = snapshot.clone();
+            ctx.policy_hash = policy_hash.clone();
+            ctx.transcript.policy_hash = Some(policy_hash.clone());
 
-        // Transition to Running
-        {
-            let mut executions = self.executions.write();
-            if let Some(ctx) = executions.get_mut(execution_id) {
-                ctx.status = ExecutionStatus::Running;
-            }
-        }
+            let mut data = HashMap::new();
+            data.insert(
+                "policy_id".into(),
+                serde_json::Value::String("execution_snapshot".into()),
+            );
+            data.insert(
+                "outcome".into(),
+                serde_json::Value::String("snapshot_bound".into()),
+            );
+            data.insert(
+                "scope".into(),
+                serde_json::Value::String("execution".into()),
+            );
+            data.insert("policy_hash".into(), serde_json::Value::String(policy_hash));
+            ctx.transcript.add_entry(EntryType::PolicyDecision, data);
+            snapshot
+        };
 
         // Enforce graph-level policies
         {
-            let policy_engine = self.policy_engine.read();
             let mut executions = self.executions.write();
             let ctx = executions.get_mut(execution_id).unwrap();
 
-            if let Err(e) = policy_engine.enforce_graph(&ctx.graph, &mut ctx.transcript) {
+            if let Err(e) = policy_snapshot.enforce_graph(&ctx.graph, &mut ctx.transcript) {
                 ctx.status = ExecutionStatus::Failed;
                 ctx.error = Some(e.to_string());
 
                 let mut data = HashMap::new();
                 data.insert("error".into(), serde_json::Value::String(e.to_string()));
                 ctx.transcript.add_entry(EntryType::Failure, data);
+                ctx.transcript.determinism_hash = Some(ctx.determinism_tracker.hash());
                 return Err(e);
             }
         }
@@ -1198,6 +1831,10 @@ impl IntelligenceOrchestrator {
             if let Some(ctx) = executions.get_mut(execution_id) {
                 ctx.status = ExecutionStatus::Failed;
                 ctx.error = Some(e.to_string());
+                let mut data = HashMap::new();
+                data.insert("error".into(), serde_json::Value::String(e.to_string()));
+                ctx.transcript.add_entry(EntryType::Failure, data);
+                ctx.transcript.determinism_hash = Some(ctx.determinism_tracker.hash());
             }
             return Err(e);
         }
@@ -1211,7 +1848,7 @@ impl IntelligenceOrchestrator {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
-            - ctx.start_time;
+            .saturating_sub(ctx.start_time);
 
         let mut data = HashMap::new();
         data.insert(
@@ -1325,11 +1962,18 @@ impl IntelligenceOrchestrator {
 
         // Enforce node policies
         {
-            let policy_engine = self.policy_engine.read();
+            let policy_snapshot = {
+                let executions = self.executions.read();
+                executions
+                    .get(execution_id)
+                    .expect("validated execution")
+                    .policy_snapshot
+                    .clone()
+            };
             let mut executions = self.executions.write();
             let ctx = executions.get_mut(execution_id).unwrap();
 
-            if let Err(e) = policy_engine.enforce_node(&node, &mut ctx.transcript) {
+            if let Err(e) = policy_snapshot.enforce_node(&node, &mut ctx.transcript) {
                 let mut data = HashMap::new();
                 data.insert("node_id".into(), serde_json::Value::String(node_id.into()));
                 data.insert("error".into(), serde_json::Value::String(e.to_string()));
@@ -1393,8 +2037,19 @@ impl IntelligenceOrchestrator {
             .get(execution_id)
             .ok_or_else(|| DioError::State(format!("Unknown execution ID: {}", execution_id)))?;
 
+        if ctx.status != ExecutionStatus::Completed {
+            return Ok(false);
+        }
+
         // Verify transcript integrity
         ctx.transcript.verify_integrity()?;
+
+        if ctx.transcript.execution_id != ctx.execution_id
+            || ctx.transcript.policy_hash.as_deref() != Some(ctx.policy_hash.as_str())
+            || ctx.policy_snapshot.hash()? != ctx.policy_hash
+        {
+            return Ok(false);
+        }
 
         // Verify graph hash
         if ctx.graph.hash() != ctx.transcript.graph_hash {
@@ -1402,10 +2057,87 @@ impl IntelligenceOrchestrator {
         }
 
         // Verify determinism hash
-        if let Some(ref recorded) = ctx.transcript.determinism_hash {
-            if ctx.determinism_tracker.hash() != *recorded {
-                return Ok(false);
-            }
+        let Some(recorded) = ctx.transcript.determinism_hash.as_deref() else {
+            return Ok(false);
+        };
+        if ctx.determinism_tracker.hash() != recorded {
+            return Ok(false);
+        }
+
+        let submissions = ctx.transcript.get_entries_by_type(EntryType::Submission);
+        let completions = ctx.transcript.get_entries_by_type(EntryType::Completion);
+        if submissions.len() != 1
+            || completions.len() != 1
+            || !ctx
+                .transcript
+                .entries()
+                .last()
+                .is_some_and(|entry| entry.entry_type == EntryType::Completion)
+            || !ctx
+                .transcript
+                .get_entries_by_type(EntryType::Failure)
+                .is_empty()
+            || !ctx
+                .transcript
+                .get_entries_by_type(EntryType::NodeFailure)
+                .is_empty()
+            || !ctx
+                .transcript
+                .get_entries_by_type(EntryType::PolicyViolation)
+                .is_empty()
+        {
+            return Ok(false);
+        }
+        let submission = submissions[0];
+        if submission
+            .data
+            .get("graph_hash")
+            .and_then(|value| value.as_str())
+            != Some(ctx.transcript.graph_hash.as_str())
+        {
+            return Ok(false);
+        }
+
+        let policy_bindings: Vec<_> = ctx
+            .transcript
+            .get_entries_by_type(EntryType::PolicyDecision)
+            .into_iter()
+            .filter(|entry| {
+                entry.data.get("scope").and_then(|value| value.as_str()) == Some("execution")
+                    && entry.data.get("outcome").and_then(|value| value.as_str())
+                        == Some("snapshot_bound")
+            })
+            .collect();
+        if policy_bindings.len() != 1
+            || policy_bindings[0]
+                .data
+                .get("policy_hash")
+                .and_then(|value| value.as_str())
+                != Some(ctx.policy_hash.as_str())
+        {
+            return Ok(false);
+        }
+
+        let starts = ctx.transcript.get_entries_by_type(EntryType::NodeStart);
+        let node_completions = ctx.transcript.get_entries_by_type(EntryType::NodeComplete);
+        if starts.len() != ctx.graph.nodes.len()
+            || node_completions.len() != ctx.graph.nodes.len()
+            || ctx.node_results.len() != ctx.graph.nodes.len()
+        {
+            return Ok(false);
+        }
+        let completed_ids: HashSet<_> = node_completions
+            .iter()
+            .filter_map(|entry| entry.data.get("node_id").and_then(|value| value.as_str()))
+            .collect();
+        if completed_ids.len() != ctx.graph.nodes.len()
+            || ctx
+                .graph
+                .nodes
+                .iter()
+                .any(|node| !completed_ids.contains(node.id.as_str()))
+        {
+            return Ok(false);
         }
 
         Ok(true)
@@ -1437,6 +2169,7 @@ impl IntelligenceOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
 
     fn node(id: &str, node_type: NodeType, deps: &[&str]) -> GraphNode {
         GraphNode::new(
@@ -1468,15 +2201,19 @@ mod tests {
     fn test_graph_cycle_detected() {
         let n1 = node("a", NodeType::Output, &["b"]);
         let n2 = node("b", NodeType::Output, &["a"]);
-        let g = ExecutionGraph::new(vec![n1, n2], HashMap::new(), "1.0".into()).unwrap();
-        assert!(matches!(g.validate(), Err(DioError::Graph(_))));
+        assert!(matches!(
+            ExecutionGraph::new(vec![n1, n2], HashMap::new(), "1.0".into()),
+            Err(DioError::Graph(_))
+        ));
     }
 
     #[test]
     fn test_graph_missing_dep_detected() {
         let n1 = node("a", NodeType::Output, &["missing"]);
-        let g = ExecutionGraph::new(vec![n1], HashMap::new(), "1.0".into()).unwrap();
-        assert!(matches!(g.validate(), Err(DioError::Graph(_))));
+        assert!(matches!(
+            ExecutionGraph::new(vec![n1], HashMap::new(), "1.0".into()),
+            Err(DioError::Graph(_))
+        ));
     }
 
     #[test]
@@ -1521,6 +2258,18 @@ mod tests {
         t.sign(key);
         assert!(t.verify_signature(key));
         assert!(!t.verify_signature(b"wrong_key_32_bytes_exactly!!!!!"));
+    }
+
+    #[test]
+    fn test_transcript_signature_separates_variable_length_fields() {
+        let key = b"secret_key_32_bytes_exactly!!!!";
+        let mut signed = ExecutionTranscript::new("a".into(), "bc".into(), 1000);
+        signed.sign(key);
+
+        let mut substituted = ExecutionTranscript::new("ab".into(), "c".into(), 1000);
+        substituted.signature = signed.signature;
+
+        assert!(!substituted.verify_signature(key));
     }
 
     #[test]
@@ -1744,11 +2493,33 @@ mod tests {
 
     #[test]
     fn test_orchestrator_full_lifecycle() {
-        let engine = PolicyEngine::new();
+        let mut engine = PolicyEngine::new();
+        let mut conditions = HashMap::new();
+        conditions.insert("allowed_models".into(), serde_json::json!(["test-model"]));
+        engine.add_rule(
+            PolicyRule::new(
+                "model_access".into(),
+                PolicyType::ModelAccess,
+                conditions,
+                vec!["allow".into()],
+                "Authorize the test model".into(),
+            )
+            .unwrap(),
+        );
         let orchestrator = IntelligenceOrchestrator::new(engine, 100);
 
         let n1 = node("input", NodeType::Output, &[]);
-        let n2 = node("process", NodeType::ModelCall, &["input"]);
+        let mut model_data = HashMap::new();
+        model_data.insert("model_name".into(), serde_json::json!("test-model"));
+        let n2 = GraphNode::new(
+            "process".into(),
+            NodeType::ModelCall,
+            model_data,
+            Determinism::Deterministic,
+            vec!["input".into()],
+            HashMap::new(),
+        )
+        .unwrap();
         let n3 = node("output", NodeType::Output, &["process"]);
 
         let graph = ExecutionGraph::new(vec![n1, n2, n3], HashMap::new(), "1.0".into()).unwrap();
@@ -1816,6 +2587,601 @@ mod tests {
         let result = orchestrator.execute(&exec_id);
         assert!(matches!(result, Err(DioError::PolicyViolation { .. })));
         assert_eq!(orchestrator.status(&exec_id), Some(ExecutionStatus::Failed));
+        let transcript = orchestrator.transcript(&exec_id).unwrap();
+        assert_eq!(transcript.get_entries_by_type(EntryType::Failure).len(), 1);
+        assert!(transcript.determinism_hash.is_some());
+        assert!(!orchestrator.verify(&exec_id).unwrap());
+    }
+
+    #[test]
+    fn test_submit_revalidates_public_graph_state() {
+        let empty = ExecutionGraph {
+            nodes: vec![],
+            metadata: HashMap::new(),
+            version: "1.0".into(),
+        };
+        let orchestrator = IntelligenceOrchestrator::new(PolicyEngine::new(), 10);
+        assert!(matches!(
+            orchestrator.submit_graph(empty),
+            Err(DioError::Graph(_))
+        ));
+
+        let unsupported = ExecutionGraph {
+            nodes: vec![node("output", NodeType::Output, &[])],
+            metadata: HashMap::new(),
+            version: "2.0".into(),
+        };
+        assert!(matches!(
+            orchestrator.submit_graph(unsupported),
+            Err(DioError::Graph(_))
+        ));
+    }
+
+    #[test]
+    fn test_malformed_deserialized_policy_fails_closed() {
+        let mut conditions = HashMap::new();
+        conditions.insert("max_nodes".into(), serde_json::json!(-1));
+        assert!(matches!(
+            PolicyRule::new(
+                "bad_limit".into(),
+                PolicyType::ResourceLimits,
+                conditions.clone(),
+                vec!["deny".into()],
+                "Invalid limit".into(),
+            ),
+            Err(DioError::Validation(_))
+        ));
+
+        let malformed = PolicyRule {
+            id: "bad_limit".into(),
+            policy_type: PolicyType::ResourceLimits,
+            conditions,
+            actions: vec!["deny".into()],
+            description: "Bypassed constructor".into(),
+            priority: 0,
+        };
+        let mut engine = PolicyEngine::new();
+        engine.add_rule(malformed);
+        let graph = ExecutionGraph::new(
+            vec![node("output", NodeType::Output, &[])],
+            HashMap::new(),
+            "1.0".into(),
+        )
+        .unwrap();
+        let mut transcript = ExecutionTranscript::new("t".into(), graph.hash(), 0);
+        assert!(matches!(
+            engine.enforce_graph(&graph, &mut transcript),
+            Err(DioError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn test_policy_hash_and_enforcement_share_total_rule_order() {
+        let make_rule = |id: &str| {
+            let mut conditions = HashMap::new();
+            conditions.insert("allowed_models".into(), serde_json::json!(["model"]));
+            PolicyRule::new(
+                id.into(),
+                PolicyType::ModelAccess,
+                conditions,
+                vec!["allow".into()],
+                id.into(),
+            )
+            .unwrap()
+        };
+        let a = make_rule("a");
+        let z = make_rule("z");
+
+        let mut first = PolicyEngine::new();
+        first.add_rule(z.clone());
+        first.add_rule(a.clone());
+        let mut second = PolicyEngine::new();
+        second.add_rule(a);
+        second.add_rule(z);
+
+        assert_eq!(first.hash().unwrap(), second.hash().unwrap());
+        assert_eq!(
+            first
+                .rules()
+                .iter()
+                .map(|rule| rule.id.as_str())
+                .collect::<Vec<_>>(),
+            second
+                .rules()
+                .iter()
+                .map(|rule| rule.id.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_privileged_nodes_require_explicit_matching_authorization() {
+        let cases = [
+            (NodeType::ModelCall, "model_name", "model-a"),
+            (NodeType::ToolCall, "tool_name", "search"),
+            (NodeType::SideEffect, "effect_type", "write_file"),
+        ];
+        let engine = PolicyEngine::new();
+
+        for (node_type, key, value) in cases {
+            let mut data = HashMap::new();
+            data.insert(key.into(), serde_json::json!(value));
+            let governed = GraphNode::new(
+                format!("node_{}", node_type),
+                node_type,
+                data,
+                Determinism::Deterministic,
+                vec![],
+                HashMap::new(),
+            )
+            .unwrap();
+            let mut transcript = ExecutionTranscript::new("t".into(), "h".into(), 0);
+            assert!(matches!(
+                engine.enforce_node(&governed, &mut transcript),
+                Err(DioError::PolicyViolation { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn test_human_approval_is_bound_to_trusted_graph_hash() {
+        let mut metadata = HashMap::new();
+        metadata.insert("human_approved".into(), serde_json::json!(true));
+        let graph = ExecutionGraph::new(
+            vec![node("output", NodeType::Output, &[])],
+            metadata,
+            "1.0".into(),
+        )
+        .unwrap();
+
+        let mut untrusted_conditions = HashMap::new();
+        untrusted_conditions.insert("required".into(), serde_json::json!(true));
+        let untrusted_rule = PolicyRule::new(
+            "approval".into(),
+            PolicyType::HumanApproval,
+            untrusted_conditions,
+            vec!["deny".into()],
+            "Approval".into(),
+        )
+        .unwrap();
+        let mut untrusted_engine = PolicyEngine::new();
+        untrusted_engine.add_rule(untrusted_rule);
+        let mut transcript = ExecutionTranscript::new("t".into(), graph.hash(), 0);
+        assert!(matches!(
+            untrusted_engine.enforce_graph(&graph, &mut transcript),
+            Err(DioError::PolicyViolation { .. })
+        ));
+
+        let mut trusted_conditions = HashMap::new();
+        trusted_conditions.insert("required".into(), serde_json::json!(true));
+        trusted_conditions.insert(
+            "approved_graph_hashes".into(),
+            serde_json::json!([graph.hash()]),
+        );
+        let mut trusted_engine = PolicyEngine::new();
+        trusted_engine.add_rule(
+            PolicyRule::new(
+                "approval".into(),
+                PolicyType::HumanApproval,
+                trusted_conditions,
+                vec!["deny".into()],
+                "Approval".into(),
+            )
+            .unwrap(),
+        );
+        let mut trusted_transcript = ExecutionTranscript::new("t".into(), graph.hash(), 0);
+        assert!(trusted_engine
+            .enforce_graph(&graph, &mut trusted_transcript)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_cost_ceiling_uses_conservative_nonnegative_total() {
+        let mut conditions = HashMap::new();
+        conditions.insert("max_cost".into(), serde_json::json!(10.0));
+        let mut engine = PolicyEngine::new();
+        engine.add_rule(
+            PolicyRule::new(
+                "cost".into(),
+                PolicyType::CostCeiling,
+                conditions,
+                vec!["deny".into()],
+                "Cost ceiling".into(),
+            )
+            .unwrap(),
+        );
+
+        let mut data = HashMap::new();
+        data.insert("cost".into(), serde_json::json!(100.0));
+        let costly = GraphNode::new(
+            "costly".into(),
+            NodeType::Output,
+            data,
+            Determinism::Deterministic,
+            vec![],
+            HashMap::new(),
+        )
+        .unwrap();
+        let mut metadata = HashMap::new();
+        metadata.insert("estimated_cost".into(), serde_json::json!(1.0));
+        let graph = ExecutionGraph::new(vec![costly], metadata, "1.0".into()).unwrap();
+        let mut transcript = ExecutionTranscript::new("t".into(), graph.hash(), 0);
+        assert!(matches!(
+            engine.enforce_graph(&graph, &mut transcript),
+            Err(DioError::PolicyViolation { .. })
+        ));
+
+        let mut negative = HashMap::new();
+        negative.insert("cost".into(), serde_json::json!(-1.0));
+        assert!(GraphNode::new(
+            "negative".into(),
+            NodeType::Output,
+            negative,
+            Determinism::Deterministic,
+            vec![],
+            HashMap::new(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_cost_decision_is_stable_for_graph_hash_equivalent_order() {
+        fn cost_node(id: &str, cost: f64) -> GraphNode {
+            let mut data = HashMap::new();
+            data.insert("cost".into(), serde_json::json!(cost));
+            GraphNode::new(
+                id.into(),
+                NodeType::Output,
+                data,
+                Determinism::Deterministic,
+                vec![],
+                HashMap::new(),
+            )
+            .unwrap()
+        }
+
+        let big = 9_007_199_254_740_992.0_f64;
+        let big_node = cost_node("big", big);
+        let one_a = cost_node("one_a", 1.0);
+        let first = ExecutionGraph::new(
+            vec![big_node.clone(), one_a.clone()],
+            HashMap::new(),
+            "1.0".into(),
+        )
+        .unwrap();
+        let reordered =
+            ExecutionGraph::new(vec![one_a, big_node], HashMap::new(), "1.0".into()).unwrap();
+        assert_eq!(first.hash(), reordered.hash());
+
+        let mut conditions = HashMap::new();
+        conditions.insert("max_cost".into(), serde_json::json!(big));
+        let mut engine = PolicyEngine::new();
+        engine.add_rule(
+            PolicyRule::new(
+                "cost".into(),
+                PolicyType::CostCeiling,
+                conditions,
+                vec!["deny".into()],
+                "Cost ceiling".into(),
+            )
+            .unwrap(),
+        );
+
+        for graph in [first, reordered] {
+            let mut transcript = ExecutionTranscript::new("t".into(), graph.hash(), 0);
+            assert!(matches!(
+                engine.enforce_graph(&graph, &mut transcript),
+                Err(DioError::PolicyViolation { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn test_resource_totals_and_egress_fields_fail_closed() {
+        let mut resource_conditions = HashMap::new();
+        resource_conditions.insert("max_tokens".into(), serde_json::json!(10));
+        let mut resource_engine = PolicyEngine::new();
+        resource_engine.add_rule(
+            PolicyRule::new(
+                "resources".into(),
+                PolicyType::ResourceLimits,
+                resource_conditions,
+                vec!["deny".into()],
+                "Token limit".into(),
+            )
+            .unwrap(),
+        );
+        let models: Vec<_> = ["a", "b"]
+            .iter()
+            .map(|id| {
+                let mut data = HashMap::new();
+                data.insert("model_name".into(), serde_json::json!("model"));
+                data.insert("tokens".into(), serde_json::json!(6));
+                GraphNode::new(
+                    (*id).into(),
+                    NodeType::ModelCall,
+                    data,
+                    Determinism::Deterministic,
+                    vec![],
+                    HashMap::new(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let graph = ExecutionGraph::new(models, HashMap::new(), "1.0".into()).unwrap();
+        let mut transcript = ExecutionTranscript::new("t".into(), graph.hash(), 0);
+        assert!(matches!(
+            resource_engine.enforce_graph(&graph, &mut transcript),
+            Err(DioError::PolicyViolation { .. })
+        ));
+
+        let mut egress_engine = PolicyEngine::new();
+        let mut tool_conditions = HashMap::new();
+        tool_conditions.insert("allowed_tools".into(), serde_json::json!(["search"]));
+        egress_engine.add_rule(
+            PolicyRule::new(
+                "tools".into(),
+                PolicyType::ToolAccess,
+                tool_conditions,
+                vec!["allow".into()],
+                "Tool access".into(),
+            )
+            .unwrap(),
+        );
+        let mut egress_conditions = HashMap::new();
+        egress_conditions.insert(
+            "allowed_domains".into(),
+            serde_json::json!(["trusted.example"]),
+        );
+        egress_engine.add_rule(
+            PolicyRule::new(
+                "egress".into(),
+                PolicyType::DataEgress,
+                egress_conditions,
+                vec!["allow".into()],
+                "Egress".into(),
+            )
+            .unwrap(),
+        );
+        let mut tool_data = HashMap::new();
+        tool_data.insert("tool_name".into(), serde_json::json!("search"));
+        let tool = GraphNode::new(
+            "tool".into(),
+            NodeType::ToolCall,
+            tool_data,
+            Determinism::Deterministic,
+            vec![],
+            HashMap::new(),
+        )
+        .unwrap();
+        let mut egress_transcript = ExecutionTranscript::new("t".into(), "h".into(), 0);
+        assert!(matches!(
+            egress_engine.enforce_node(&tool, &mut egress_transcript),
+            Err(DioError::PolicyViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn test_signature_verification_rejects_entry_tampering() {
+        let mut transcript = ExecutionTranscript::new("test".into(), "hash".into(), 1000);
+        transcript.add_entry(EntryType::Submission, HashMap::new());
+        let key = b"secret_key_32_bytes_exactly!!!!";
+        transcript.sign(key);
+        transcript.entries[0]
+            .data
+            .insert("tampered".into(), serde_json::json!(true));
+        assert!(!transcript.verify_signature(key));
+    }
+
+    #[test]
+    fn test_cache_capacity_and_completed_only_verification() {
+        let orchestrator = IntelligenceOrchestrator::new(PolicyEngine::new(), 1);
+        let graph = ExecutionGraph::new(
+            vec![node("output", NodeType::Output, &[])],
+            HashMap::new(),
+            "1.0".into(),
+        )
+        .unwrap();
+
+        let first = orchestrator.submit_graph(graph.clone()).unwrap();
+        assert!(!orchestrator.verify(&first).unwrap());
+        assert!(matches!(
+            orchestrator.submit_graph(graph.clone()),
+            Err(DioError::State(_))
+        ));
+        orchestrator.execute(&first).unwrap();
+        assert!(orchestrator.verify(&first).unwrap());
+
+        let second = orchestrator.submit_graph(graph).unwrap();
+        assert!(orchestrator.status(&first).is_none());
+        assert_eq!(orchestrator.status(&second), Some(ExecutionStatus::Pending));
+    }
+
+    #[test]
+    fn test_execution_binds_current_policy_and_records_snapshot() {
+        let mut engine = PolicyEngine::new();
+        let mut initial_conditions = HashMap::new();
+        initial_conditions.insert("allowed_models".into(), serde_json::json!(["model-a"]));
+        engine.add_rule(
+            PolicyRule::new(
+                "initial".into(),
+                PolicyType::ModelAccess,
+                initial_conditions,
+                vec!["allow".into()],
+                "Initial policy".into(),
+            )
+            .unwrap(),
+        );
+        let orchestrator = IntelligenceOrchestrator::new(engine, 10);
+        let mut data = HashMap::new();
+        data.insert("model_name".into(), serde_json::json!("model-a"));
+        let graph = ExecutionGraph::new(
+            vec![GraphNode::new(
+                "model".into(),
+                NodeType::ModelCall,
+                data,
+                Determinism::Deterministic,
+                vec![],
+                HashMap::new(),
+            )
+            .unwrap()],
+            HashMap::new(),
+            "1.0".into(),
+        )
+        .unwrap();
+        let execution_id = orchestrator.submit_graph(graph).unwrap();
+        let submission_policy_hash = orchestrator
+            .transcript(&execution_id)
+            .unwrap()
+            .policy_hash
+            .unwrap();
+
+        let mut later_conditions = HashMap::new();
+        later_conditions.insert("allowed_models".into(), serde_json::json!(["model-b"]));
+        orchestrator.add_policy(
+            PolicyRule::new(
+                "initial".into(),
+                PolicyType::ModelAccess,
+                later_conditions,
+                vec!["allow".into()],
+                "Replacement policy".into(),
+            )
+            .unwrap(),
+        );
+
+        assert!(matches!(
+            orchestrator.execute(&execution_id),
+            Err(DioError::PolicyViolation { .. })
+        ));
+        let transcript = orchestrator.transcript(&execution_id).unwrap();
+        assert_ne!(
+            transcript.policy_hash.as_deref(),
+            Some(submission_policy_hash.as_str())
+        );
+        assert_eq!(
+            transcript
+                .get_entries_by_type(EntryType::PolicyDecision)
+                .into_iter()
+                .filter(|entry| {
+                    entry.data.get("scope").and_then(|value| value.as_str()) == Some("execution")
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            transcript
+                .get_entries_by_type(EntryType::PolicyViolation)
+                .len(),
+            1
+        );
+        assert_eq!(
+            orchestrator.status(&execution_id),
+            Some(ExecutionStatus::Failed)
+        );
+        assert!(!orchestrator.verify(&execution_id).unwrap());
+    }
+
+    #[test]
+    fn test_execution_time_policy_update_can_succeed_and_verify() {
+        let mut engine = PolicyEngine::new();
+        let mut access = HashMap::new();
+        access.insert("allowed_models".into(), serde_json::json!(["model-a"]));
+        engine.add_rule(
+            PolicyRule::new(
+                "access".into(),
+                PolicyType::ModelAccess,
+                access,
+                vec!["allow".into()],
+                "Model access".into(),
+            )
+            .unwrap(),
+        );
+        let orchestrator = IntelligenceOrchestrator::new(engine, 10);
+        let mut data = HashMap::new();
+        data.insert("model_name".into(), serde_json::json!("model-a"));
+        let graph = ExecutionGraph::new(
+            vec![GraphNode::new(
+                "model".into(),
+                NodeType::ModelCall,
+                data,
+                Determinism::Deterministic,
+                vec![],
+                HashMap::new(),
+            )
+            .unwrap()],
+            HashMap::new(),
+            "1.0".into(),
+        )
+        .unwrap();
+        let execution_id = orchestrator.submit_graph(graph).unwrap();
+        let submitted_hash = orchestrator
+            .transcript(&execution_id)
+            .unwrap()
+            .policy_hash
+            .unwrap();
+
+        let mut limits = HashMap::new();
+        limits.insert("max_nodes".into(), serde_json::json!(1));
+        orchestrator.add_policy(
+            PolicyRule::new(
+                "capacity".into(),
+                PolicyType::ResourceLimits,
+                limits,
+                vec!["deny".into()],
+                "Node capacity".into(),
+            )
+            .unwrap(),
+        );
+
+        let transcript = orchestrator.execute(&execution_id).unwrap();
+        assert_ne!(
+            transcript.policy_hash.as_deref(),
+            Some(submitted_hash.as_str())
+        );
+        assert!(orchestrator.verify(&execution_id).unwrap());
+    }
+
+    #[test]
+    fn test_concurrent_execute_has_exactly_one_winner() {
+        let orchestrator = Arc::new(IntelligenceOrchestrator::new(PolicyEngine::new(), 10));
+        let graph = ExecutionGraph::new(
+            vec![node("output", NodeType::Output, &[])],
+            HashMap::new(),
+            "1.0".into(),
+        )
+        .unwrap();
+        let execution_id = orchestrator.submit_graph(graph).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let orchestrator = Arc::clone(&orchestrator);
+                let execution_id = execution_id.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    orchestrator.execute(&execution_id)
+                })
+            })
+            .collect();
+        barrier.wait();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(DioError::State(_))))
+                .count(),
+            1
+        );
+        let transcript = orchestrator.transcript(&execution_id).unwrap();
+        assert_eq!(
+            transcript.get_entries_by_type(EntryType::Completion).len(),
+            1
+        );
     }
 
     #[test]
