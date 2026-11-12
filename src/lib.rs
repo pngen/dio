@@ -867,10 +867,18 @@ impl ExecutionTranscript {
 
     /// Appends a new entry to the transcript chain.
     pub fn add_entry(&mut self, entry_type: EntryType, data: HashMap<String, serde_json::Value>) {
-        let timestamp = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        // The wall clock is not monotonic. An appended entry must never predate
+        // the transcript or its previous entry, or the transcript would fail
+        // its own integrity verification.
+        let timestamp = self
+            .entries
+            .last()
+            .map_or(now, |previous| now.max(previous.timestamp))
+            .max(self.created_at);
 
         let entry = TranscriptEntry {
             entry_type,
@@ -2247,6 +2255,36 @@ mod tests {
         t.add_entry(EntryType::Submission, HashMap::new());
         t.add_entry(EntryType::Completion, HashMap::new());
         assert!(t.verify_integrity().is_ok());
+    }
+
+    #[test]
+    fn test_appended_entries_keep_timestamp_ordering_when_clock_is_behind() {
+        // A creation time ahead of the wall clock models a clock that stepped
+        // backwards after the transcript was created.
+        let mut behind_creation = ExecutionTranscript::new("t".into(), "h".into(), u64::MAX);
+        behind_creation.add_entry(EntryType::Submission, HashMap::new());
+        assert!(behind_creation.verify_integrity().is_ok());
+
+        // A prior entry ahead of the wall clock models a clock that stepped
+        // backwards between two appends.
+        let mut behind_entry = ExecutionTranscript::new("t".into(), "h".into(), 0);
+        let future = TranscriptEntry {
+            entry_type: EntryType::Submission,
+            timestamp: u64::MAX,
+            sequence: 0,
+            data: HashMap::new(),
+            prev_hash: "genesis".into(),
+        };
+        behind_entry.chain_head = future.hash();
+        behind_entry.next_sequence = 1;
+        behind_entry.entries.push(future);
+        assert!(behind_entry.verify_integrity().is_ok());
+        behind_entry.add_entry(EntryType::Completion, HashMap::new());
+        assert!(behind_entry.verify_integrity().is_ok());
+
+        let key = b"secret_key_32_bytes_exactly!!!!";
+        behind_entry.sign(key);
+        assert!(behind_entry.verify_signature(key));
     }
 
     #[test]
