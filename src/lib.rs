@@ -1244,30 +1244,31 @@ impl PolicyEngine {
 
                     if let Some(max) = rule.conditions.get("max_retries").and_then(|v| v.as_u64()) {
                         let mut total = 0_u64;
-                        for node in graph
-                            .nodes
-                            .iter()
-                            .filter(|node| node.node_type == NodeType::Retry)
-                        {
-                            let Some(actual) = node
+                        // Retry nodes must declare a count. A count declared by
+                        // any other node is limited per node, so it belongs in
+                        // the total as well.
+                        for node in &graph.nodes {
+                            let actual = node
                                 .data
                                 .get("retry_count")
-                                .and_then(|value| value.as_u64())
-                            else {
+                                .and_then(|value| value.as_u64());
+                            if node.node_type == NodeType::Retry && actual.is_none() {
                                 return self.violation(
                                     rule,
                                     transcript,
                                     format!("Retry node '{}' must declare retry_count", node.id),
                                 );
-                            };
-                            let Some(next) = total.checked_add(actual) else {
-                                return self.violation(
-                                    rule,
-                                    transcript,
-                                    "Total retry count overflowed".into(),
-                                );
-                            };
-                            total = next;
+                            }
+                            if let Some(actual) = actual {
+                                let Some(next) = total.checked_add(actual) else {
+                                    return self.violation(
+                                        rule,
+                                        transcript,
+                                        "Total retry count overflowed".into(),
+                                    );
+                                };
+                                total = next;
+                            }
                         }
                         if total > max {
                             return self.violation(
@@ -1494,21 +1495,25 @@ impl PolicyEngine {
                     self.decision(rule, transcript, "node", Some(&node.id));
                 }
                 PolicyType::DataEgress => {
-                    if matches!(
+                    // Model, tool and side-effect nodes must declare where
+                    // their data goes. Any other node that declares an egress
+                    // domain is held to the same allow-list.
+                    let declared = node
+                        .data
+                        .get("egress_domain")
+                        .and_then(|value| value.as_str());
+                    let egress_required = matches!(
                         node.node_type,
                         NodeType::ModelCall | NodeType::ToolCall | NodeType::SideEffect
-                    ) {
-                        let Some(domain) = node
-                            .data
-                            .get("egress_domain")
-                            .and_then(|value| value.as_str())
-                        else {
-                            return self.violation(
-                                rule,
-                                transcript,
-                                format!("Node '{}' must declare egress_domain", node.id),
-                            );
-                        };
+                    );
+                    if egress_required && declared.is_none() {
+                        return self.violation(
+                            rule,
+                            transcript,
+                            format!("Node '{}' must declare egress_domain", node.id),
+                        );
+                    }
+                    if let Some(domain) = declared {
                         let allowed = rule.conditions["allowed_domains"]
                             .as_array()
                             .expect("validated allowed_domains");
@@ -2997,6 +3002,104 @@ mod tests {
             egress_engine.enforce_node(&tool, &mut egress_transcript),
             Err(DioError::PolicyViolation { .. })
         ));
+    }
+
+    #[test]
+    fn test_declared_egress_and_retries_are_governed_on_every_node_type() {
+        fn declaring(id: &str, key: &str, value: serde_json::Value) -> GraphNode {
+            let mut data = HashMap::new();
+            data.insert(key.into(), value);
+            GraphNode::new(
+                id.into(),
+                NodeType::Output,
+                data,
+                Determinism::Deterministic,
+                vec![],
+                HashMap::new(),
+            )
+            .unwrap()
+        }
+
+        let mut egress_conditions = HashMap::new();
+        egress_conditions.insert(
+            "allowed_domains".into(),
+            serde_json::json!(["trusted.example"]),
+        );
+        let mut egress_engine = PolicyEngine::new();
+        egress_engine.add_rule(
+            PolicyRule::new(
+                "egress".into(),
+                PolicyType::DataEgress,
+                egress_conditions,
+                vec!["allow".into()],
+                "Egress".into(),
+            )
+            .unwrap(),
+        );
+        // An output node that declares egress to a domain outside the allow-list
+        // must be denied exactly like a model, tool or side-effect node.
+        let mut transcript = ExecutionTranscript::new("t".into(), "h".into(), 0);
+        assert!(matches!(
+            egress_engine.enforce_node(
+                &declaring(
+                    "leak",
+                    "egress_domain",
+                    serde_json::json!("untrusted.example")
+                ),
+                &mut transcript
+            ),
+            Err(DioError::PolicyViolation { .. })
+        ));
+        assert!(egress_engine
+            .enforce_node(
+                &declaring("ok", "egress_domain", serde_json::json!("trusted.example")),
+                &mut transcript
+            )
+            .is_ok());
+        assert!(egress_engine
+            .enforce_node(&node("silent", NodeType::Output, &[]), &mut transcript)
+            .is_ok());
+
+        let mut retry_conditions = HashMap::new();
+        retry_conditions.insert("max_retries".into(), serde_json::json!(3));
+        let mut retry_engine = PolicyEngine::new();
+        retry_engine.add_rule(
+            PolicyRule::new(
+                "retries".into(),
+                PolicyType::ResourceLimits,
+                retry_conditions,
+                vec!["deny".into()],
+                "Retry limit".into(),
+            )
+            .unwrap(),
+        );
+        // Each node is within the limit, but the declared total is not.
+        let graph = ExecutionGraph::new(
+            vec![
+                declaring("a", "retry_count", serde_json::json!(2)),
+                declaring("b", "retry_count", serde_json::json!(2)),
+            ],
+            HashMap::new(),
+            "1.0".into(),
+        )
+        .unwrap();
+        let mut transcript = ExecutionTranscript::new("t".into(), graph.hash(), 0);
+        assert!(matches!(
+            retry_engine.enforce_graph(&graph, &mut transcript),
+            Err(DioError::PolicyViolation { .. })
+        ));
+
+        let within = ExecutionGraph::new(
+            vec![
+                declaring("a", "retry_count", serde_json::json!(2)),
+                node("b", NodeType::Output, &[]),
+            ],
+            HashMap::new(),
+            "1.0".into(),
+        )
+        .unwrap();
+        let mut transcript = ExecutionTranscript::new("t".into(), within.hash(), 0);
+        assert!(retry_engine.enforce_graph(&within, &mut transcript).is_ok());
     }
 
     #[test]
